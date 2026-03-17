@@ -1,3 +1,12 @@
+```
+  ██████╗██╗      █████╗ ██╗
+ ██╔════╝██║     ██╔══██╗██║
+ ██║     ██║     ███████║██║
+ ██║     ██║     ██╔══██║██║
+ ╚██████╗███████╗██║  ██║██║
+  ╚═════╝╚══════╝╚═╝  ╚═╝╚═╝
+```
+
 # clai
 
 AI-powered task orchestrator. Give it a goal — it plans a DAG of tasks and executes them with Claude.
@@ -82,6 +91,45 @@ clai accept <session-id> <task-id>
 clai accept <session-id> <task-id> --message "fixed schema manually"
 ```
 
+## SWE mode — automated bug fixing
+
+`clai swe` is a self-contained agentic loop for fixing bugs in an existing repo:
+
+1. **Localize** — Claude navigates the repo (file tree, code search, test runs) and produces a `LocalizationReport` pinpointing root-cause files and functions.
+2. **Plan** — `planSWE()` designs a minimal 3-phase fix: apply patch → test-fix while-loop → summary.
+3. **Execute** — The fix runs with full reinforcement: if tests still fail, Claude re-localizes with context from the previous attempt and tries again (up to `--rounds` times).
+
+```bash
+# Fix a bug (up to 3 reinforcement rounds by default)
+clai swe "TypeError in auth middleware" --repo ./my-app
+
+# Run in Docker containers
+clai swe "auth middleware fails on expired tokens" --repo ./app --docker
+
+# More rounds for stubborn bugs
+clai swe "flaky pagination query" --repo ./api --rounds 5
+
+# Inspect localization + plan without executing
+clai swe "null pointer in user service" --repo ./app --plan-only
+
+# Stream Claude's reasoning live
+clai swe "broken CSV export" --repo ./app --verbose
+```
+
+## Turing-complete task types
+
+In addition to plain tasks, the planner can emit control-flow task types that make DAGs Turing-complete at runtime:
+
+| Type | Description |
+|---|---|
+| `branch` | Evaluates a condition; activates `on_true` or `on_false` dependency paths |
+| `for_each` | Expands a list into N parallel child tasks at runtime |
+| `while` | Loops by spawning body + next-check task chains (DAG stays acyclic) |
+| `barrier` | Blocks until all `wait_for` tasks complete |
+| `wait` | Polls a shell command until exit code 0 or timeout |
+
+These compose with regular tasks and with each other. All new task types are backwards compatible — sessions without them work exactly as before.
+
 ## Task DAG
 
 Each task has:
@@ -141,14 +189,27 @@ ssh -L 4242:localhost:4242 user@server
 
 ```
 src/
-  index.js        CLI (commander) — start, run, status, list, logs, viz, serve, containers, exec, accept
+  index.js        CLI (commander) — start, run, status, list, logs, viz, serve, containers, exec, accept, swe
   planner.js      Claude Opus plans the task DAG (structured JSON output)
   executor.js     Claude executes tasks via tool use (write_file, run_command, read_file)
+  localize.js     Agentic repo navigator — pinpoints root-cause files/functions
+  reinforce.js    Outer reinforcement loop — re-localizes on failure with prior context
+  runner.js       Dispatches tasks by type (plain, branch, for_each, while, barrier, wait)
+  client.js       Anthropic SDK wrapper with rate-limit retry and debug logging
   docker.js       Docker container runner — RO base mount + RW overlays per output path
   worker.js       In-container task executor (called via docker exec)
+  condition.js    Evaluates shell / JS expression / natural language conditions
+  template.js     cloneTask with {{variable}} substitution, resolveItems
   state.js        Session persistence (sessions/*.json)
-  dag.js          Topological sort, ready-task selection, cycle detection
+  dag.js          Topological sort, ready-task selection, cycle detection, barrier-awareness
   hooks.js        Event emission to JSONL logs
+  viz.js          Terminal + HTML DAG visualizer
+  task-types/
+    branch.js     branch task handler
+    for-each.js   for_each task handler
+    while.js      while task handler
+    barrier.js    barrier task handler
+    wait.js       wait task handler
   commands/
     exec.js       Handler for clai exec
     accept.js     Handler for clai accept
