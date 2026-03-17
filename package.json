@@ -1,0 +1,17 @@
+{
+  "name": "clai",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "clai": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test tests/dag.test.js tests/state.test.js tests/hooks.test.js tests/planner.test.js tests/executor.test.js tests/docker.test.js tests/runner.test.js tests/integration.test.js",
+    "test:watch": "node --test --watch tests/dag.test.js tests/state.test.js tests/hooks.test.js tests/planner.test.js tests/executor.test.js tests/docker.test.js tests/runner.test.js tests/integration.test.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "commander": "^12.0.0"
+  }
+}
