@@ -15,7 +15,7 @@ clai start "build a REST API with auth and tests" --run
 ## Install
 
 ```bash
-git clone <repo>
+git clone https://github.com/akshatgit/clai
 cd clai
 npm install -g .
 export ANTHROPIC_API_KEY=sk-...
@@ -73,7 +73,13 @@ clai serve --port 8080
 
 # Docker containers
 clai containers
-docker exec -it clai-<session-id>-task_1 sh
+
+# Exec into a running task container
+clai exec <session-id> <task-id>
+
+# Manually mark a task as completed (then run downstream tasks)
+clai accept <session-id> <task-id>
+clai accept <session-id> <task-id> --message "fixed schema manually"
 ```
 
 ## Task DAG
@@ -109,12 +115,15 @@ Each task has:
 
 ```
 src/
-  index.js     CLI (commander) — start, run, status, list, logs, viz, serve, containers
-  planner.js   Claude plans the task DAG (structured JSON output)
-  executor.js  Claude executes individual tasks (streaming)
-  docker.js    Docker container runner
-  worker.js    In-container task executor
-  state.js     Session persistence
-  dag.js       Topological sort, ready-task selection, cycle detection
-  hooks.js     Event emission to JSONL logs
+  index.js        CLI (commander) — start, run, status, list, logs, viz, serve, containers, exec, accept
+  planner.js      Claude Opus plans the task DAG (structured JSON output)
+  executor.js     Claude executes tasks via tool use (write_file, run_command, read_file)
+  docker.js       Docker container runner — RO base mount + RW overlays per output path
+  worker.js       In-container task executor (called via docker exec)
+  state.js        Session persistence (sessions/*.json)
+  dag.js          Topological sort, ready-task selection, cycle detection
+  hooks.js        Event emission to JSONL logs
+  commands/
+    exec.js       Handler for clai exec
+    accept.js     Handler for clai accept
 ```
