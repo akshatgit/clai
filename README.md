@@ -105,6 +105,32 @@ Each task has:
 | `medium` | Sonnet 4.6 | Logic, integration, refactoring |
 | `high` | Opus 4.6 | Architecture, algorithms, critical decisions |
 
+## Visualization
+
+Three ways to inspect a session's task graph:
+
+**Terminal** — layered ASCII view, works over SSH:
+```bash
+clai viz <session-id>
+```
+
+**HTML** — generates a Mermaid flowchart and opens it in the browser. Nodes are colour-coded by status (pending/running/completed/failed). Each node expands to show the full task result:
+```bash
+clai viz <session-id> --html
+```
+
+**Web server** — live dashboard listing all sessions. Click any session to see its interactive DAG. Refresh to see status updates as tasks run:
+```bash
+clai serve              # http://localhost:4242
+clai serve --port 8080
+```
+
+To view remotely (e.g. clai running on a server):
+```bash
+ssh -L 4242:localhost:4242 user@server
+# then open http://localhost:4242
+```
+
 ## Sessions
 
 - State: `sessions/<id>.json`
