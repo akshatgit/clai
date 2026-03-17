@@ -5,18 +5,16 @@
  *   "exit: <cmd>"   — run shell command, true if exit code 0
  *   "js: <expr>"    — evaluate JS expression with `result` in scope
  *   (anything else) — ask Claude (Haiku) to judge true/false
+ *
+ * When dockerContainerName is provided, shell commands are wrapped as
+ *   docker exec <name> sh -c '<cmd>'
+ * so the condition runs inside the session container (where test deps live)
+ * rather than on the host.
  */
 
 import { execSync } from 'child_process'
-import Anthropic from '@anthropic-ai/sdk'
-
-let _client = null
-function getClient() {
-  if (!_client) _client = new Anthropic()
-  return _client
-}
-/** Override client — used by tests. */
-export function _setClient(c) { _client = c }
+import { client, MODELS, _setClient } from './client.js'
+export { _setClient }
 
 export function detectConditionMode(conditionString) {
   if (conditionString.startsWith('exit:')) return 'shell'
@@ -28,16 +26,28 @@ export function detectConditionMode(conditionString) {
  * Evaluate a condition string and return true/false.
  *
  * @param {string} conditionString
- * @param {{ session, task, lastResult: string }} context
+ * @param {{ session, task, lastResult?: string, dockerContainerName?: string }} context
  * @returns {Promise<boolean>}
  */
-export async function evaluateCondition(conditionString, { session, task, lastResult = '' }) {
+export async function evaluateCondition(conditionString, {
+  session,
+  task,
+  lastResult = '',
+  dockerContainerName = null,
+}) {
   const mode = detectConditionMode(conditionString)
 
   if (mode === 'shell') {
-    const cmd = conditionString.slice('exit:'.length).trim()
+    const innerCmd = conditionString.slice('exit:'.length).trim()
+
+    // Run inside the session container when Docker is active.
+    // The container has the repo's dependencies installed; the host likely does not.
+    const cmd = dockerContainerName
+      ? `docker exec ${dockerContainerName} sh -c ${JSON.stringify(innerCmd)}`
+      : innerCmd
+
     try {
-      execSync(cmd, { stdio: 'pipe', timeout: 30_000 })
+      execSync(cmd, { stdio: 'pipe', timeout: 60_000 })
       return true
     } catch {
       return false
@@ -72,8 +82,8 @@ ${recentResults || '(none yet)'}
 
 Respond with exactly one word: "true" or "false".`
 
-  const response = await getClient().messages.create({
-    model: 'claude-haiku-4-5-20251001',
+  const response = await client.messages.create({
+    model: MODELS.low,
     max_tokens: 10,
     messages: [{ role: 'user', content: prompt }],
   })

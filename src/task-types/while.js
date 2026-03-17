@@ -12,13 +12,20 @@
  *
  * The DAG stays acyclic because each iteration creates new task IDs with
  * strictly forward dependencies.
+ *
+ * dockerOpts = { useDocker, repoPath } is threaded through from runSessionTasks
+ * so the shell condition check runs inside the session container (where test
+ * dependencies are installed) rather than on the host.
  */
 
+import { execSync } from 'child_process'
 import { cloneTask } from '../template.js'
 import { evaluateCondition } from '../condition.js'
 import { insertDynamicTasks } from '../state.js'
+import { containerName as getContainerName } from '../docker.js'
 
-export async function executeWhile(session, task, _onChunk) {
+export async function executeWhile(session, task, _onChunk, dockerOpts = {}) {
+  const { useDocker = false } = dockerOpts
   const maxIter = task.max_iterations ?? 5
   const iterCount = task.iteration_count ?? 0
 
@@ -37,8 +44,26 @@ export async function executeWhile(session, task, _onChunk) {
   // On first iteration: always enter the loop (skip condition check)
   // On subsequent iterations: evaluate condition against last body result
   let shouldContinue = true
+  let conditionOutput = null  // test output captured when condition is checked
+
   if (iterCount > 0) {
-    shouldContinue = await evaluateCondition(task.condition, { session, task, lastResult })
+    // When running in Docker, the condition shell command runs inside the session
+    // container so it has access to the installed test dependencies.
+    const dockerContainerName = useDocker ? getContainerName(session.id) : null
+
+    // Capture test output for the condition check when it's a shell condition.
+    // This output is injected into the next body task's description as context
+    // so the body doesn't have to re-run tests from scratch to know what failed.
+    if (task.condition.startsWith('exit:') && dockerContainerName) {
+      conditionOutput = captureShellOutput(task.condition, dockerContainerName)
+    }
+
+    shouldContinue = await evaluateCondition(task.condition, {
+      session,
+      task,
+      lastResult,
+      dockerContainerName,
+    })
   }
 
   if (!shouldContinue) {
@@ -50,7 +75,17 @@ export async function executeWhile(session, task, _onChunk) {
   if (!bodyTemplate) throw new Error(`while: body template "${task.body}" not found`)
 
   const bodyId = `${task.body}_${task.id}_body_${iterCount}`
+
+  // Inject test failure context into the body task description so it knows
+  // exactly what to fix without needing to re-run tests first.
+  const failureContext = conditionOutput
+    ? `\n\n## Test Failures from Previous Check\nThe following tests are still failing — fix these:\n\`\`\`\n${conditionOutput.slice(0, 2000)}\n\`\`\``
+    : ''
+
   const bodyTask = cloneTask(bodyTemplate, bodyId, { iteration: iterCount, i: iterCount })
+  if (failureContext) {
+    bodyTask.description = bodyTask.description + failureContext
+  }
   bodyTask.dependencies = [task.id]
 
   // Spawn next while-check task (runs after body completes)
@@ -61,7 +96,7 @@ export async function executeWhile(session, task, _onChunk) {
   nextWhile.iteration_count = iterCount + 1
   nextWhile.status = 'pending'
 
-  // Mark body template as skipped on first iteration
+  // Mark body template as skipped on first iteration so it doesn't run standalone
   if (iterCount === 0 && session.dag.tasks[task.body]) {
     session.dag.tasks[task.body].status = 'skipped'
   }
@@ -70,4 +105,28 @@ export async function executeWhile(session, task, _onChunk) {
 
   if (_onChunk) _onChunk(`while: iteration ${iterCount} — spawned ${bodyId} + ${nextWhileId}\n`)
   return `while: iteration ${iterCount} started. Body: ${bodyId}. Next check: ${nextWhileId}.`
+}
+
+/**
+ * Run the condition shell command and capture its output (stdout+stderr) for
+ * context injection into the next body task, even if the command fails.
+ *
+ * Returns null if output cannot be captured (e.g. docker exec not available).
+ */
+function captureShellOutput(conditionString, dockerContainerName) {
+  const innerCmd = conditionString.slice('exit:'.length).trim()
+
+  // Strip leading "! " if present to get the actual test command
+  const testCmd = innerCmd.startsWith('! ') ? innerCmd.slice(2).trim() : innerCmd
+
+  const cmd = dockerContainerName
+    ? `docker exec ${dockerContainerName} sh -c ${JSON.stringify(testCmd)}`
+    : testCmd
+
+  try {
+    return execSync(cmd, { stdio: 'pipe', timeout: 60_000 }).toString()
+  } catch (e) {
+    // Non-zero exit is expected when tests fail — return the output anyway
+    return ((e.stdout?.toString() ?? '') + (e.stderr?.toString() ?? '')) || null
+  }
 }

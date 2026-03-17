@@ -1,22 +1,11 @@
-import Anthropic from '@anthropic-ai/sdk'
 import { writeFileSync, readFileSync, mkdirSync, existsSync } from 'fs'
 import { execSync } from 'child_process'
 import { dirname } from 'path'
-
-let _client = null
-function getClient() {
-  if (!_client) _client = new Anthropic()
-  return _client
-}
-/** Override the Anthropic client — used by tests. */
-export function _setClient(c) { _client = c }
+import { client, MODELS, _setClient } from './client.js'
+export { _setClient }
 
 // Model selection by task complexity — use cheaper models for simpler tasks
-export const COMPLEXITY_MODEL_MAP = {
-  low: 'claude-haiku-4-5-20251001',
-  medium: 'claude-sonnet-4-6',
-  high: 'claude-opus-4-6',
-}
+export const COMPLEXITY_MODEL_MAP = MODELS
 
 // Tools Claude can use to actually implement tasks
 const TASK_TOOLS = [
@@ -58,22 +47,59 @@ const TASK_TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'str_replace',
+    description: 'Replace an exact string in a file. Safer than write_file for small edits — only the changed lines are rewritten. Fails if old_str is not found or appears more than once.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        path:    { type: 'string', description: 'File path to edit' },
+        old_str: { type: 'string', description: 'Exact string to replace (must appear exactly once in the file)' },
+        new_str: { type: 'string', description: 'Replacement string' },
+      },
+      required: ['path', 'old_str', 'new_str'],
+      additionalProperties: false,
+    },
+  },
 ]
 
-/** Execute a tool call and return the result string. */
-function executeTool(name, input) {
+/**
+ * Execute a tool call and return the result string.
+ *
+ * @param {string} name
+ * @param {object} input
+ * @param {object} opts
+ * @param {string}   [opts.workspaceDir]      - Remap /workspace to this host path for file ops
+ * @param {Function} [opts.dockerRunCommand]  - Override run_command to exec in Docker container
+ */
+function executeTool(name, input, opts = {}) {
+  const { workspaceDir = null, dockerRunCommand = null } = opts
+
+  // Remap /workspace paths to the host workspaceDir (used in Docker mode)
+  function resolve(p) {
+    if (!workspaceDir) return p
+    if (p === '/workspace') return workspaceDir
+    if (p.startsWith('/workspace/')) return workspaceDir + '/' + p.slice('/workspace/'.length)
+    return p
+  }
+
   try {
     if (name === 'write_file') {
       const { path, content } = input
-      mkdirSync(dirname(path), { recursive: true })
-      writeFileSync(path, content)
+      const resolved = resolve(path)
+      mkdirSync(dirname(resolved), { recursive: true })
+      writeFileSync(resolved, content)
       return `OK: wrote ${content.length} bytes to ${path}`
     }
 
     if (name === 'run_command') {
       const { command, cwd = '/workspace' } = input
+      if (dockerRunCommand) {
+        return dockerRunCommand(command, cwd)
+      }
+      const resolvedCwd = resolve(cwd)
       const out = execSync(command, {
-        cwd: existsSync(cwd) ? cwd : '/workspace',
+        cwd: existsSync(resolvedCwd) ? resolvedCwd : (workspaceDir ?? '/workspace'),
         stdio: 'pipe',
         timeout: 120_000,
       })
@@ -82,7 +108,18 @@ function executeTool(name, input) {
 
     if (name === 'read_file') {
       const { path } = input
-      return readFileSync(path, 'utf8')
+      return readFileSync(resolve(path), 'utf8')
+    }
+
+    if (name === 'str_replace') {
+      const { path, old_str, new_str } = input
+      const resolved = resolve(path)
+      const content = readFileSync(resolved, 'utf8')
+      const count = content.split(old_str).length - 1
+      if (count === 0) return `ERROR: str_replace: string not found in ${path}`
+      if (count > 1) return `ERROR: str_replace: string found ${count} times — make old_str more specific`
+      writeFileSync(resolved, content.replace(old_str, new_str))
+      return `OK: replaced string in ${path}`
     }
 
     return `ERROR: unknown tool "${name}"`
@@ -100,7 +137,7 @@ function executeTool(name, input) {
  * @param {function} onChunk - Called with each streamed text/status chunk
  * @returns {string}         - The full result text
  */
-export async function executeTask(session, task, onChunk) {
+export async function executeTask(session, task, onChunk, opts = {}) {
   const completedContext = buildCompletedContext(session)
   const previousAttempt = task.result
     ? `\n\nNote: This task was previously attempted. Previous result:\n${task.result}\n\nPlease improve upon or complete the previous attempt.`
@@ -150,17 +187,15 @@ Use the write_file and run_command tools to implement this task completely.
 4. End with a brief summary of what you did`
 
   const model = COMPLEXITY_MODEL_MAP[task.complexity] ?? COMPLEXITY_MODEL_MAP.high
-  const supportsThinking = model !== COMPLEXITY_MODEL_MAP.low
 
   const messages = [{ role: 'user', content: prompt }]
   let resultLines = []
 
   // Agentic loop: keep going until Claude stops using tools
   while (true) {
-    const response = await getClient().messages.create({
+    const response = await client.messages.create({
       model,
       max_tokens: 16384,
-      ...(supportsThinking ? { thinking: { type: 'adaptive' } } : {}),
       system: 'You are an expert software developer. Use the provided tools to implement tasks completely — write actual files and run commands.',
       tools: TASK_TOOLS,
       messages,
@@ -183,7 +218,7 @@ Use the write_file and run_command tools to implement this task completely.
     const toolResults = []
     for (const block of response.content) {
       if (block.type !== 'tool_use') continue
-      const output = executeTool(block.name, block.input)
+      const output = executeTool(block.name, block.input, opts)
       if (onChunk) onChunk(`→ ${output.slice(0, 120)}\n`)
       toolResults.push({
         type: 'tool_result',

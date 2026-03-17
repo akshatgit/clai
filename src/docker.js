@@ -1,6 +1,7 @@
-import { spawn as _defaultSpawn } from 'child_process'
-import { readFileSync, unlinkSync, existsSync, mkdirSync, writeFileSync } from 'fs'
-import { join, dirname, isAbsolute } from 'path'
+import { spawn as _defaultSpawn, spawnSync } from 'child_process'
+import { execSync } from 'child_process'
+import { readFileSync, unlinkSync, existsSync, mkdirSync } from 'fs'
+import { join, dirname } from 'path'
 import { fileURLToPath } from 'url'
 import { SESSIONS_DIR } from './state.js'
 
@@ -11,16 +12,81 @@ let _spawn = _defaultSpawn
 export function _setSpawn(fn) { _spawn = fn }
 export function _resetSpawn() { _spawn = _defaultSpawn }
 
-/** Stable container name for a given session + task. */
-export function containerName(sessionId, taskId) {
-  return `clai-${sessionId}-${taskId}`
+/**
+ * Session-scoped container name. All tasks in a session share one container so
+ * that package installs (pip, npm) from task_env persist for later tasks.
+ *
+ * The old per-task name (clai-<sid>-<tid>) caused: packages installed in
+ * task_env's container were lost when task_fix started a fresh container.
+ */
+export function containerName(sessionId, _taskId) {
+  return `clai-${sessionId}`
 }
 
 /**
- * Run a task inside a dedicated Docker container.
+ * Ensure the session container is running. Creates it if needed.
  *
- * The container is kept alive after the task finishes so the user can
- * exec into it with:  docker exec -it <name> sh
+ * The container mounts /workspace read-write so all tasks can freely
+ * write files (patches, installs, compiled artifacts). This replaces the
+ * old RO-base + selective-RW-overlay model which prevented writes to
+ * files not listed in output_paths.
+ *
+ * Called by runTaskInDocker before every docker exec.
+ */
+export async function ensureSessionContainer(session, { repoPath, dockerImage = 'node:22-alpine' } = {}) {
+  const name = containerName(session.id)
+
+  // Check if already running — if so, reuse it (preserves installed packages)
+  try {
+    const state = execSync(`docker inspect --format={{.State.Running}} ${name}`, {
+      stdio: 'pipe',
+    }).toString().trim()
+    if (state === 'true') return name
+    // Exists but stopped — clean it up and recreate
+    await silentRun('docker', ['rm', '-f', name])
+  } catch {
+    // Container doesn't exist yet — fall through to create it
+  }
+
+  const sessionsDir = SESSIONS_DIR
+  const srcDir = join(projectRoot, 'src')
+  const nodeModulesDir = join(projectRoot, 'node_modules')
+  const packageJson = join(projectRoot, 'package.json')
+
+  const workspaceMounts = repoPath
+    ? ['-v', `${repoPath}:/workspace`, '-w', '/workspace']
+    : ['-w', '/app']
+
+  await run('docker', [
+    'run', '-d',
+    '--name', name,
+    '--memory=4g',
+    '--cpus=2',
+    '--pids-limit=512',
+    '--cap-drop=ALL',
+    '--security-opt=no-new-privileges',
+    '-e', `ANTHROPIC_API_KEY=${process.env.ANTHROPIC_API_KEY ?? ''}`,
+    '-v', `${sessionsDir}:/app/sessions`,
+    '-v', `${srcDir}:/app/src:ro`,
+    '-v', `${nodeModulesDir}:/app/node_modules:ro`,
+    '-v', `${packageJson}:/app/package.json:ro`,
+    ...workspaceMounts,
+    dockerImage,
+    'tail', '-f', '/dev/null',
+  ])
+
+  return name
+}
+
+/**
+ * Run a task inside the session's shared Docker container.
+ *
+ * All tasks in a session share one container (session-scoped, not task-scoped).
+ * This means:
+ *  - pip/npm installs from task_env persist for task_fix and the while-loop body
+ *  - /workspace is mounted RW — any file write is immediately visible to the host
+ *    and to subsequent tasks (no output_paths whitelist required)
+ *  - The container stays alive after the session for post-hoc inspection
  *
  * @param {object} session
  * @param {object} task
@@ -30,75 +96,31 @@ export function containerName(sessionId, taskId) {
  * @returns {string}          - the full task result text
  */
 export async function runTaskInDocker(session, task, onChunk, { repoPath } = {}) {
-  const name = containerName(session.id, task.id)
-  // SESSIONS_DIR is a live binding — respects _configure() overrides (used by tests)
-  const sessionsDir = SESSIONS_DIR
-  const resultFile = join(sessionsDir, `.result-${session.id}-${task.id}`)
-  const srcDir = join(projectRoot, 'src')
-  const nodeModulesDir = join(projectRoot, 'node_modules')
-  const packageJson = join(projectRoot, 'package.json')
+  const dockerImage = task.docker_image || 'node:22-alpine'
 
-  // Remove any leftover container from a previous run of this task
-  await silentRun('docker', ['rm', '-f', name])
+  // Start or reuse the session container (provides the shell execution environment)
+  const name = await ensureSessionContainer(session, { repoPath, dockerImage })
 
-  const repoMounts = repoPath
-    ? buildRepoMounts(repoPath, task.input_paths ?? ['.'], task.output_paths ?? [])
-    : ['-w', '/app']
+  // Run the executor on the HOST (avoids requiring node inside Python/Go/etc. containers).
+  // Shell commands are proxied into the container via docker exec; file operations use
+  // the bind-mounted repoPath directly on the host.
+  const { executeTask } = await import('./executor.js')
 
-  // Start the container detached — it stays alive via `tail -f /dev/null`
-  // The worker is then launched via docker exec below
-  await run('docker', [
-    'run', '-d',
-    '--name', name,
-    // Resource caps — prevent runaway tasks from affecting the host
-    '--memory=2g',
-    '--cpus=2',
-    '--pids-limit=512',
-    // Drop all Linux capabilities; task code shouldn't need any
-    '--cap-drop=ALL',
-    // Prevent setuid/setgid binaries from gaining extra privileges
-    '--security-opt=no-new-privileges',
-    '-e', `ANTHROPIC_API_KEY=${process.env.ANTHROPIC_API_KEY ?? ''}`,
-    '-v', `${sessionsDir}:/app/sessions`,
-    '-v', `${srcDir}:/app/src:ro`,
-    '-v', `${nodeModulesDir}:/app/node_modules:ro`,
-    '-v', `${packageJson}:/app/package.json:ro`,
-    ...repoMounts,
-    task.docker_image || 'node:22-alpine',
-    'tail', '-f', '/dev/null',
-  ])
-
-  // Run the worker inside the container; worker streams chunks to stderr.
-  // Use --user to match host UID/GID so the worker can write to bind-mounted dirs.
-  const uid = process.getuid?.() ?? 0
-  const gid = process.getgid?.() ?? 0
-  return new Promise((resolve, reject) => {
-    const proc = _spawn('docker', [
-      'exec',
-      '--user', `${uid}:${gid}`,
-      name,
-      'node', '/app/src/worker.js', session.id, task.id,
-    ])
-
-    proc.stderr.on('data', chunk => {
-      if (onChunk) onChunk(chunk.toString())
+  function dockerRunCommand(command, cwd = '/workspace') {
+    const result = spawnSync('docker', ['exec', '-w', cwd, name, 'sh', '-c', command], {
+      stdio: 'pipe',
+      timeout: 120_000,
     })
+    const stdout = result.stdout?.toString() ?? ''
+    const stderr = result.stderr?.toString() ?? ''
+    const combined = (stdout + stderr).trim()
+    // Return combined output even on non-zero exit so Claude can see error messages
+    return combined || (result.status !== 0 ? `ERROR: exit code ${result.status}` : '(no output)')
+  }
 
-    proc.on('close', code => {
-      if (code !== 0) {
-        reject(new Error(`Worker in container "${name}" exited with code ${code}`))
-        return
-      }
-      try {
-        const result = readFileSync(resultFile, 'utf8')
-        if (existsSync(resultFile)) unlinkSync(resultFile)
-        resolve(result)
-      } catch (err) {
-        reject(new Error(`Failed to read task result from container: ${err.message}`))
-      }
-    })
-
-    proc.on('error', err => reject(new Error(`docker exec failed: ${err.message}`)))
+  return executeTask(session, task, onChunk, {
+    workspaceDir: repoPath ?? null,
+    dockerRunCommand,
   })
 }
 
@@ -115,54 +137,6 @@ export async function listTaskContainers() {
     proc.on('close', () => resolve(out.trim()))
     proc.on('error', reject)
   })
-}
-
-// ─── Mount builder ────────────────────────────────────────────────────────────
-
-/**
- * Build Docker -v mount flags for a task's file access pattern:
- *
- *  - The repo root is mounted read-only at /workspace
- *  - Each output_path is mounted read-write on top (overlaying the RO base)
- *    Docker processes bind mounts in order, so a later RW mount for a specific
- *    path takes precedence over the earlier RO root mount.
- *  - Directories and non-existent files in output_paths are created on the host
- *    as empty placeholders so Docker has something to bind-mount.
- *
- * @param {string}   repoPath     - Absolute host path to the project repo
- * @param {string[]} inputPaths   - Repo-relative paths to read (mounted RO via root)
- * @param {string[]} outputPaths  - Repo-relative paths to write (overlaid RW)
- * @returns {string[]} Flat array of Docker args: ['-v', '...', '-w', '/workspace', ...]
- */
-function buildRepoMounts(repoPath, inputPaths, outputPaths) {
-  const args = []
-
-  // Base: whole repo read-only (covers all input_paths)
-  args.push('-v', `${repoPath}:/workspace:ro`)
-  args.push('-w', '/workspace')
-
-  // Overlay: each output path mounted read-write on top of the RO base
-  for (const rel of outputPaths) {
-    const hostPath = isAbsolute(rel) ? rel : join(repoPath, rel)
-    const containerPath = `/workspace/${rel}`
-
-    // Ensure the host path exists so Docker can bind-mount it.
-    // If it looks like a file (has an extension or no trailing slash), create
-    // an empty file; otherwise create a directory.
-    if (!existsSync(hostPath)) {
-      const looksLikeFile = /\.[^/]+$/.test(rel) && !rel.endsWith('/')
-      if (looksLikeFile) {
-        mkdirSync(dirname(hostPath), { recursive: true })
-        writeFileSync(hostPath, '')
-      } else {
-        mkdirSync(hostPath, { recursive: true })
-      }
-    }
-
-    args.push('-v', `${hostPath}:${containerPath}`)  // no :ro → writable
-  }
-
-  return args
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

@@ -52,9 +52,20 @@ export function getReadyTasks(tasks, order) {
  * barrier tasks use a special rule: only skipped if ALL wait_for tasks failed/skipped.
  */
 export function getBlockedTasks(tasks) {
+  // Build a set of body-template IDs whose parent while task is skipped/failed.
+  // These templates should never run standalone — they only run as cloned iterations.
+  const blockedBodies = new Set()
+  for (const t of Object.values(tasks)) {
+    if (t.type === 'while' && t.body && (t.status === 'skipped' || t.status === 'failed')) {
+      blockedBodies.add(t.body)
+    }
+  }
+
   return Object.keys(tasks).filter(id => {
     const task = tasks[id]
     if (task.status !== 'pending') return false
+
+    if (blockedBodies.has(id)) return true
 
     if (task.type === 'barrier') {
       const waitFor = task.wait_for?.length ? task.wait_for : task.dependencies

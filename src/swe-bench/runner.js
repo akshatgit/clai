@@ -1,6 +1,6 @@
 // src/swe-bench/runner.js
 // Main orchestration loop for running clai against SWE-bench instances.
-// Clones repos, formats goals, invokes clai, and collects patches.
+// Clones repos, formats goals, invokes reinforcedSWE, and collects patches.
 
 import { execSync, spawnSync } from 'child_process'
 import { mkdtempSync, existsSync, readFileSync, writeFileSync } from 'fs'
@@ -9,6 +9,7 @@ import { tmpdir } from 'os'
 import { fetchInstances } from './fetch-instances.js'
 import { formatGoal } from './goal-formatter.js'
 import { extractPatch } from './extract-patch.js'
+import { reinforcedSWE } from '../reinforce.js'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -55,43 +56,9 @@ function cloneRepo(repo, baseCommit) {
   return tmpDir
 }
 
-/**
- * Run `clai start <goal> --run --docker --repo <repoDir>` synchronously.
- * Returns the session ID extracted from stdout, or null on failure.
- */
-function claiStartAndRun(goal, repoDir, { patchOutput = null, timeout = 600_000 } = {}) {
-  // Find the clai binary relative to this file: ../../index.js → run via node
-  const claiIndex = join(import.meta.dirname, '..', 'index.js')
-
-  const args = ['start', goal, '--run', '--docker', '--repo', repoDir]
-  if (patchOutput) args.push('--patch-output', patchOutput)
-
-  const result = spawnSync(process.execPath, [claiIndex, ...args], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    encoding: 'utf8',
-    timeout,
-  })
-
-  if (result.error) {
-    warn(`clai spawn error: ${result.error.message}`)
-    return null
-  }
-
-  const output = (result.stdout ?? '') + (result.stderr ?? '')
-
-  // Extract session ID from output like "Session ID: sess_abc123"
-  const match = output.match(/Session\s+(?:ID:\s*)?(\S+)\s+created/)
-    ?? output.match(/Session ID:\s*(\S+)/)
-  if (match) return match[1]
-
-  // Fallback: look for any sess_... token
-  const fallback = output.match(/\b(sess_[a-z0-9]+)\b/)
-  return fallback ? fallback[1] : null
-}
-
 // ─── Per-instance runner ──────────────────────────────────────────────────────
 
-async function runInstance(instance, { timeout = 600_000 } = {}) {
+async function runInstance(instance, { timeout = 600_000, maxRounds = 3, verbose = false, onPlanned = null } = {}) {
   const { instance_id, repo, base_commit } = instance
   let repoDir = null
 
@@ -99,25 +66,32 @@ async function runInstance(instance, { timeout = 600_000 } = {}) {
     // 1. Clone the repo at the base commit
     repoDir = cloneRepo(repo, base_commit)
 
-    // 2. Build a patch output path inside a temp file
-    const patchFile = join(tmpdir(), `clai-patch-${instance_id}.diff`)
+    // 2. Format the issue as an SWE goal
+    const issueText = formatGoal(instance)
+    log(`Running reinforcedSWE for ${instance_id} (up to ${maxRounds} rounds)`)
 
-    // 3. Format goal and run clai
-    const goal = formatGoal(instance)
-    log(`Running clai for ${instance_id}`)
-    claiStartAndRun(goal, repoDir, { patchOutput: patchFile, timeout })
+    // 3. Run the full localize → planSWE → execute → test-fix → reinforce pipeline.
+    //    useDocker=true so each session gets a shared container with the repo bind-mounted
+    //    at /workspace RW — patches written by the executor flow back to repoDir on host.
+    const result = await reinforcedSWE(issueText, repoDir, {
+      maxRounds,
+      useDocker: true,
+      verbose,
+      onRound: (round, total) => log(`${instance_id} — round ${round}/${total}`),
+      onPlanned: onPlanned ? (round, session) => onPlanned(round, maxRounds, session) : null,
+    })
 
-    // 4. Extract patch — prefer patch file written by clai run, fall back to git diff
-    let patch = ''
-    if (existsSync(patchFile)) {
-      patch = readFileSync(patchFile, 'utf8')
+    if (result.success) {
+      log(`✓ ${instance_id} — fixed in ${result.rounds} round(s)`)
+    } else {
+      warn(`${instance_id} — not fixed after ${result.rounds} round(s)`)
     }
-    if (!patch) {
-      patch = extractPatch(repoDir)
-    }
+
+    // 4. Extract patch — git diff HEAD picks up all bind-mount writes from the container
+    const patch = extractPatch(repoDir)
 
     if (patch.trim()) {
-      log(`✓ ${instance_id} — patch captured (${patch.length} chars)`)
+      log(`  patch captured (${patch.length} chars)`)
     } else {
       warn(`${instance_id} — empty patch`)
     }
@@ -128,7 +102,8 @@ async function runInstance(instance, { timeout = 600_000 } = {}) {
     warn(`${instance_id} failed: ${err.message}`)
     return { instance_id, model_patch: '', model_name_or_path: 'clai' }
   } finally {
-    // Clean up temp dir
+    // Remove the cloned repo — the Docker session container is kept alive
+    // for post-hoc inspection (clai containers / docker exec clai-<sid> sh)
     if (repoDir) {
       try { execSync(`rm -rf "${repoDir}"`, { timeout: 10_000 }) } catch {}
     }
@@ -147,6 +122,9 @@ async function runInstance(instance, { timeout = 600_000 } = {}) {
  *   output?: string,
  *   concurrency?: number,
  *   timeout?: number,
+ *   maxRounds?: number,
+ *   verbose?: boolean,
+ *   onPlanned?: (round, total, session) => void,
  * }} opts
  */
 export async function runSweBench(opts = {}) {
@@ -157,6 +135,9 @@ export async function runSweBench(opts = {}) {
     output      = 'predictions.json',
     concurrency = 1,
     timeout     = 600_000,
+    maxRounds   = 3,
+    verbose     = false,
+    onPlanned   = null,
   } = opts
 
   // Load existing predictions to support resume
@@ -183,7 +164,9 @@ export async function runSweBench(opts = {}) {
   // Process in batches of `concurrency`
   for (let i = 0; i < pending.length; i += concurrency) {
     const batch = pending.slice(i, i + concurrency)
-    const results = await Promise.all(batch.map(inst => runInstance(inst, { timeout })))
+    const results = await Promise.all(
+      batch.map(inst => runInstance(inst, { timeout, maxRounds, verbose, onPlanned }))
+    )
 
     for (const result of results) {
       predictions.push(result)

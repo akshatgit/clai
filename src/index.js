@@ -531,23 +531,35 @@ function generateHTML(session) {
     mermaid += `  style ${id} fill:${col},color:#fff,stroke:#fff\n`
   }
 
+  const taskData = {}
+  for (const id of order) {
+    const t = tasks[id]
+    taskData[id] = {
+      id: t.id, title: t.title, status: t.status, complexity: t.complexity,
+      docker_image: t.docker_image ?? '',
+      dependencies: t.dependencies,
+      description: t.description ?? '',
+      completion_criteria: t.completion_criteria ?? [],
+      tests: t.tests ?? [],
+      result: t.result ?? '',
+      error: t.error ?? '',
+    }
+  }
+
   const taskRows = order.map(id => {
     const t = tasks[id]
     const statusBg = {
-      pending: '#f3f4f6', running: '#dbeafe', completed: '#dcfce7',
-      failed: '#fee2e2', skipped: '#fef9c3',
-    }[t.status] ?? '#f3f4f6'
-    const result = t.result
-      ? `<details><summary>View result</summary><pre style="white-space:pre-wrap;font-size:12px;background:#f8fafc;padding:12px;border-radius:6px;overflow:auto;max-height:400px">${escapeHTML(t.result)}</pre></details>`
-      : '<em style="color:#9ca3af">Not yet executed</em>'
+      pending: '#1e293b', running: '#1e3a5f', completed: '#14532d',
+      failed: '#450a0a', skipped: '#422006',
+    }[t.status] ?? '#1e293b'
     return `
-      <tr style="background:${statusBg}">
+      <tr data-task-id="${t.id}" style="background:${statusBg};cursor:pointer" title="Click for details">
         <td><code>${t.id}</code></td>
-        <td>${t.title}</td>
+        <td>${escapeHTML(t.title)}</td>
         <td>${t.status}</td>
         <td>${t.complexity}</td>
         <td>${t.dependencies.join(', ') || '—'}</td>
-        <td>${result}</td>
+        <td>${t.result ? '✓ has result' : '<em style="color:#9ca3af">—</em>'}</td>
       </tr>`
   }).join('')
 
@@ -557,6 +569,7 @@ function generateHTML(session) {
   <meta charset="UTF-8">
   <title>clai — ${escapeHTML(session.goal)}</title>
   <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; padding: 24px; }
@@ -573,9 +586,69 @@ function generateHTML(session) {
     table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
     th { background: #0f172a; padding: 8px 12px; text-align: left; color: #94a3b8; font-weight: 600; border-bottom: 1px solid #334155; }
     td { padding: 8px 12px; border-bottom: 1px solid #1e293b; vertical-align: top; }
+    tr[data-task-id]:hover td { background: rgba(96,165,250,0.08); }
     details summary { cursor: pointer; color: #60a5fa; font-size: 0.8rem; }
     pre { color: #334155; }
     code { font-size: 0.8rem; color: #7dd3fc; }
+    /* Modal */
+    #modal-backdrop {
+      display: none; position: fixed; inset: 0;
+      background: rgba(0,0,0,0.6); z-index: 100;
+      align-items: flex-start; justify-content: center;
+      padding: 40px 16px; overflow-y: auto;
+    }
+    #modal-backdrop.open { display: flex; }
+    #modal {
+      background: #1e293b; border-radius: 14px; width: 100%; max-width: 760px;
+      padding: 28px; position: relative; box-shadow: 0 24px 64px rgba(0,0,0,0.5);
+    }
+    #modal-close {
+      position: absolute; top: 16px; right: 20px; background: none; border: none;
+      color: #94a3b8; font-size: 1.4rem; cursor: pointer; line-height: 1;
+    }
+    #modal-close:hover { color: #e2e8f0; }
+    .modal-title { font-size: 1.1rem; font-weight: 700; color: #f8fafc; margin-bottom: 6px; }
+    .modal-id { font-size: .8rem; color: #64748b; margin-bottom: 18px; }
+    .modal-section { margin-bottom: 18px; }
+    .modal-label {
+      font-size: .7rem; font-weight: 700; letter-spacing: .08em;
+      text-transform: uppercase; color: #64748b; margin-bottom: 6px;
+    }
+    .modal-text { font-size: .875rem; color: #cbd5e1; line-height: 1.6; }
+    .modal-text code,.modal-list li code { background:#1e293b; color:#7dd3fc; padding:1px 5px; border-radius:4px; font-size:.8rem; font-family:monospace; }
+    .modal-list { list-style: none; padding: 0; margin: 0; }
+    .modal-list li {
+      font-size: .85rem; color: #cbd5e1; padding: 5px 0;
+      border-bottom: 1px solid #334155; display: flex; gap: 8px;
+    }
+    .modal-list li:last-child { border-bottom: none; }
+    .modal-list li::before { content: "•"; color: #475569; flex-shrink: 0; }
+    .modal-result {
+      font-size: .875rem; background: #0f172a; padding: 16px; border-radius: 8px;
+      overflow: auto; max-height: 360px; border: 1px solid #334155; color: #cbd5e1; line-height: 1.65;
+    }
+    .modal-result h1,.modal-result h2,.modal-result h3,.modal-result h4 { color:#f1f5f9; margin: .9em 0 .4em; font-size: 1em; }
+    .modal-result h1 { font-size: 1.15em; } .modal-result h2 { font-size: 1.05em; }
+    .modal-result p { margin: 0 0 .6em; }
+    .modal-result ul,.modal-result ol { padding-left: 1.4em; margin: 0 0 .6em; }
+    .modal-result li { margin-bottom: .2em; }
+    .modal-result code { background:#1e293b; color:#7dd3fc; padding:1px 5px; border-radius:4px; font-size:.8rem; font-family:monospace; }
+    .modal-result pre { background:#1e293b; border-radius:6px; padding:10px 12px; overflow:auto; margin:.5em 0; }
+    .modal-result pre code { background:none; padding:0; color:#7dd3fc; font-size:.8rem; }
+    .modal-result blockquote { border-left:3px solid #334155; margin:0 0 .6em; padding:.3em .8em; color:#94a3b8; }
+    .modal-result hr { border:none; border-top:1px solid #334155; margin:.8em 0; }
+    .modal-result a { color:#60a5fa; }
+    .modal-result strong { color:#f1f5f9; }
+    .pill {
+      display: inline-block; padding: 2px 10px; border-radius: 999px;
+      font-size: .75rem; font-weight: 600;
+    }
+    .pill-low    { background:#14532d; color:#86efac }
+    .pill-medium { background:#713f12; color:#fde68a }
+    .pill-high   { background:#7f1d1d; color:#fca5a5 }
+    .meta-row { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
+    .meta-chip { background:#0f172a; border-radius:8px; padding:8px 14px; font-size:.8rem; color:#94a3b8; }
+    .meta-chip strong { display: block; font-size: .7rem; color: #475569; margin-bottom: 2px; text-transform: uppercase; letter-spacing: .06em; }
   </style>
 </head>
 <body>
@@ -594,7 +667,7 @@ ${mermaid}
   </div>
 
   <div class="card">
-    <h2 style="font-size:1rem;margin-bottom:16px;color:#94a3b8">TASK DETAILS</h2>
+    <h2 style="font-size:1rem;margin-bottom:16px;color:#94a3b8">TASK DETAILS <span style="font-size:.75rem;font-weight:400;color:#475569">— click a row for full details</span></h2>
     <table>
       <thead>
         <tr>
@@ -605,8 +678,104 @@ ${mermaid}
     </table>
   </div>
 
+  <!-- Task detail modal -->
+  <div id="modal-backdrop">
+    <div id="modal">
+      <button id="modal-close" onclick="closeModal()">✕</button>
+      <div class="modal-title" id="m-title"></div>
+      <div class="modal-id" id="m-id"></div>
+      <div class="meta-row" id="m-meta"></div>
+      <div class="modal-section">
+        <div class="modal-label">Description</div>
+        <div class="modal-text" id="m-desc"></div>
+      </div>
+      <div class="modal-section" id="m-criteria-wrap">
+        <div class="modal-label">Completion Criteria</div>
+        <ul class="modal-list" id="m-criteria"></ul>
+      </div>
+      <div class="modal-section" id="m-tests-wrap">
+        <div class="modal-label">Tests</div>
+        <ul class="modal-list" id="m-tests"></ul>
+      </div>
+      <div class="modal-section" id="m-error-wrap">
+        <div class="modal-label" style="color:#f87171">Error</div>
+        <pre class="modal-result" id="m-error" style="color:#fca5a5;border-color:#7f1d1d"></pre>
+      </div>
+      <div class="modal-section" id="m-result-wrap">
+        <div class="modal-label">Result</div>
+        <div class="modal-result" id="m-result"></div>
+      </div>
+    </div>
+  </div>
+
   <script>
     mermaid.initialize({ startOnLoad: true, theme: 'dark', flowchart: { curve: 'basis', padding: 20 } })
+
+    const TASKS = ${JSON.stringify(taskData)}
+
+    function openModal(id) {
+      const t = TASKS[id]
+      if (!t) return
+      document.getElementById('m-title').textContent = t.title
+      document.getElementById('m-id').textContent = t.id
+
+      const complexityClass = { low: 'pill-low', medium: 'pill-medium', high: 'pill-high' }[t.complexity] ?? 'pill-low'
+      const statusColors = { pending:'#374151;color:#d1d5db', running:'#1d4ed8;color:#fff', completed:'#15803d;color:#fff', failed:'#b91c1c;color:#fff', skipped:'#a16207;color:#fff' }
+      const sc = statusColors[t.status] ?? '#374151;color:#d1d5db'
+      document.getElementById('m-meta').innerHTML = [
+        \`<div class="meta-chip"><strong>Status</strong><span style="background:\${sc};padding:2px 8px;border-radius:999px;font-size:.75rem;font-weight:600">\${t.status}</span></div>\`,
+        \`<div class="meta-chip"><strong>Complexity</strong><span class="pill \${complexityClass}">\${t.complexity}</span></div>\`,
+        t.docker_image ? \`<div class="meta-chip"><strong>Docker Image</strong>\${escHtml(t.docker_image)}</div>\` : '',
+        t.dependencies.length ? \`<div class="meta-chip"><strong>Depends on</strong>\${t.dependencies.join(', ')}</div>\` : '',
+      ].join('')
+
+      document.getElementById('m-desc').innerHTML = marked.parse(t.description || '—')
+
+      const criteria = t.completion_criteria
+      const cWrap = document.getElementById('m-criteria-wrap')
+      if (criteria.length) {
+        document.getElementById('m-criteria').innerHTML = criteria.map(c => \`<li>\${marked.parseInline(c)}</li>\`).join('')
+        cWrap.style.display = ''
+      } else { cWrap.style.display = 'none' }
+
+      const tests = t.tests
+      const tWrap = document.getElementById('m-tests-wrap')
+      if (tests.length) {
+        document.getElementById('m-tests').innerHTML = tests.map(x => \`<li>\${marked.parseInline(x)}</li>\`).join('')
+        tWrap.style.display = ''
+      } else { tWrap.style.display = 'none' }
+
+      const ew = document.getElementById('m-error-wrap')
+      if (t.error) {
+        document.getElementById('m-error').textContent = t.error
+        ew.style.display = ''
+      } else { ew.style.display = 'none' }
+
+      const rWrap = document.getElementById('m-result-wrap')
+      if (t.result) {
+        document.getElementById('m-result').innerHTML = marked.parse(t.result)
+        rWrap.style.display = ''
+      } else { rWrap.style.display = 'none' }
+
+      document.getElementById('modal-backdrop').classList.add('open')
+    }
+
+    function closeModal() {
+      document.getElementById('modal-backdrop').classList.remove('open')
+    }
+
+    function escHtml(s) {
+      return (s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')
+    }
+
+    document.getElementById('modal-backdrop').addEventListener('click', e => {
+      if (e.target === document.getElementById('modal-backdrop')) closeModal()
+    })
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal() })
+
+    document.querySelectorAll('tr[data-task-id]').forEach(row => {
+      row.addEventListener('click', () => openModal(row.dataset.taskId))
+    })
   </script>
 </body>
 </html>`
@@ -652,6 +821,7 @@ function buildIndexPage(sessions) {
   return `<!DOCTYPE html>
 <html lang="en"><head>
   <meta charset="UTF-8"><title>clai</title>
+  <script>setTimeout(() => location.reload(), 5000)</script>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;padding:32px}
@@ -741,13 +911,25 @@ function buildVizHTML(session) {
     mermaid += `  style ${id} fill:${statusColor[tasks[id].status] ?? '#6b7280'},color:#fff,stroke:#fff\n`
   }
 
+  const taskData = {}
+  for (const id of order) {
+    const t = tasks[id]
+    taskData[id] = {
+      id: t.id, title: t.title, status: t.status, complexity: t.complexity,
+      docker_image: t.docker_image ?? '',
+      dependencies: t.dependencies,
+      description: t.description ?? '',
+      completion_criteria: t.completion_criteria ?? [],
+      tests: t.tests ?? [],
+      result: t.result ?? '',
+      error: t.error ?? '',
+    }
+  }
+
   const taskRows = order.map(id => {
     const t = tasks[id]
-    const bg = { pending:'#f3f4f6', running:'#dbeafe', completed:'#dcfce7', failed:'#fee2e2', skipped:'#fef9c3' }[t.status] ?? '#f3f4f6'
-    const result = t.result
-      ? `<details><summary>View result</summary><pre style="white-space:pre-wrap;font-size:12px;background:#f8fafc;padding:12px;border-radius:6px;overflow:auto;max-height:400px">${escapeHTML(t.result)}</pre></details>`
-      : '<em style="color:#9ca3af">Not yet executed</em>'
-    return `<tr style="background:${bg}"><td><code>${t.id}</code></td><td>${escapeHTML(t.title)}</td><td>${t.status}</td><td>${t.complexity}</td><td>${t.dependencies.join(', ') || '—'}</td><td>${result}</td></tr>`
+    const bg = { pending:'#1e293b', running:'#1e3a5f', completed:'#14532d', failed:'#450a0a', skipped:'#422006' }[t.status] ?? '#1e293b'
+    return `<tr data-task-id="${t.id}" style="background:${bg};cursor:pointer" title="Click for details"><td><code>${t.id}</code></td><td>${escapeHTML(t.title)}</td><td>${t.status}</td><td>${t.complexity}</td><td>${t.dependencies.join(', ') || '—'}</td><td>${t.result ? '✓ has result' : '<em style="color:#9ca3af">—</em>'}</td></tr>`
   }).join('')
 
   return `<!DOCTYPE html>
@@ -755,6 +937,29 @@ function buildVizHTML(session) {
   <meta charset="UTF-8">
   <title>${escapeHTML(session.goal)}</title>
   <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script>
+    if (${JSON.stringify(session.status)} === 'running') {
+      history.scrollRestoration = 'manual'
+      const saved = sessionStorage.getItem('scrollY')
+      if (saved) {
+        // Wait for mermaid to finish rendering before restoring scroll
+        mermaid.initialize({startOnLoad:false,theme:'dark',flowchart:{curve:'basis',padding:20}})
+        document.addEventListener('DOMContentLoaded', async () => {
+          await mermaid.run()
+          window.scrollTo(0, parseInt(saved, 10))
+        })
+      } else {
+        mermaid.initialize({startOnLoad:true,theme:'dark',flowchart:{curve:'basis',padding:20}})
+      }
+      setInterval(() => {
+        if (!document.getElementById('modal-backdrop')?.classList.contains('open')) {
+          sessionStorage.setItem('scrollY', window.scrollY)
+          location.reload()
+        }
+      }, 3000)
+    }
+  </script>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;padding:24px}
@@ -768,16 +973,41 @@ function buildVizHTML(session) {
     table{width:100%;border-collapse:collapse;font-size:.85rem}
     th{background:#0f172a;padding:8px 12px;text-align:left;color:#94a3b8;border-bottom:1px solid #334155}
     td{padding:8px 12px;border-bottom:1px solid #1e293b;vertical-align:top}
-    details summary{cursor:pointer;color:#60a5fa;font-size:.8rem}
-    pre{color:#334155}
+    tr[data-task-id]:hover td{background:rgba(96,165,250,0.08)}
     code{font-size:.8rem;color:#7dd3fc}
     a{color:#60a5fa;text-decoration:none}
     a:hover{text-decoration:underline}
     .refresh{float:right;font-size:.8rem;color:#64748b;margin-top:4px}
+    #modal-backdrop{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:100;align-items:flex-start;justify-content:center;padding:40px 16px;overflow-y:auto}
+    #modal-backdrop.open{display:flex}
+    #modal{background:#1e293b;border-radius:14px;width:100%;max-width:760px;padding:28px;position:relative;box-shadow:0 24px 64px rgba(0,0,0,0.5)}
+    #modal-close{position:absolute;top:16px;right:20px;background:none;border:none;color:#94a3b8;font-size:1.4rem;cursor:pointer;line-height:1}
+    #modal-close:hover{color:#e2e8f0}
+    .modal-title{font-size:1.1rem;font-weight:700;color:#f8fafc;margin-bottom:6px}
+    .modal-id{font-size:.8rem;color:#64748b;margin-bottom:18px}
+    .modal-section{margin-bottom:18px}
+    .modal-label{font-size:.7rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#64748b;margin-bottom:6px}
+    .modal-text{font-size:.875rem;color:#cbd5e1;line-height:1.6}
+    .modal-list{list-style:none;padding:0;margin:0}
+    .modal-list li{font-size:.85rem;color:#cbd5e1;padding:5px 0;border-bottom:1px solid #334155;display:flex;gap:8px}
+    .modal-list li:last-child{border-bottom:none}
+    .modal-list li::before{content:"•";color:#475569;flex-shrink:0}
+    .modal-result{font-size:.875rem;background:#0f172a;padding:16px;border-radius:8px;overflow:auto;max-height:360px;border:1px solid #334155;color:#cbd5e1;line-height:1.65}
+    .modal-result h1,.modal-result h2,.modal-result h3,.modal-result h4{color:#f1f5f9;margin:.9em 0 .4em;font-size:1em}.modal-result h1{font-size:1.15em}.modal-result h2{font-size:1.05em}
+    .modal-result p{margin:0 0 .6em}.modal-result ul,.modal-result ol{padding-left:1.4em;margin:0 0 .6em}.modal-result li{margin-bottom:.2em}
+    .modal-result code{background:#1e293b;color:#7dd3fc;padding:1px 5px;border-radius:4px;font-size:.8rem;font-family:monospace}
+    .modal-result pre{background:#1e293b;border-radius:6px;padding:10px 12px;overflow:auto;margin:.5em 0}.modal-result pre code{background:none;padding:0;color:#7dd3fc;font-size:.8rem}
+    .modal-result blockquote{border-left:3px solid #334155;margin:0 0 .6em;padding:.3em .8em;color:#94a3b8}.modal-result hr{border:none;border-top:1px solid #334155;margin:.8em 0}
+    .modal-result a{color:#60a5fa}.modal-result strong{color:#f1f5f9}
+    .pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:.75rem;font-weight:600}
+    .pill-low{background:#14532d;color:#86efac}.pill-medium{background:#713f12;color:#fde68a}.pill-high{background:#7f1d1d;color:#fca5a5}
+    .meta-row{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:18px}
+    .meta-chip{background:#0f172a;border-radius:8px;padding:8px 14px;font-size:.8rem;color:#94a3b8}
+    .meta-chip strong{display:block;font-size:.7rem;color:#475569;margin-bottom:2px;text-transform:uppercase;letter-spacing:.06em}
   </style>
 </head><body>
   <p style="margin-bottom:12px"><a href="/">← All sessions</a>
-    <span class="refresh">Auto-refreshes on reload</span></p>
+    <span class="refresh">${session.status === 'running' ? '⟳ Live — refreshes every 3 s' : 'Session complete'}</span></p>
   <h1>${escapeHTML(session.goal)}</h1>
   <p class="meta">
     <code style="color:#7dd3fc">${session.id}</code>
@@ -789,13 +1019,73 @@ function buildVizHTML(session) {
     <div class="mermaid">\n${mermaid}</div>
   </div>
   <div class="card">
-    <h2 style="font-size:1rem;margin-bottom:16px;color:#94a3b8">TASK DETAILS</h2>
+    <h2 style="font-size:1rem;margin-bottom:16px;color:#94a3b8">TASK DETAILS <span style="font-size:.75rem;font-weight:400;color:#475569">— click a row for full details</span></h2>
     <table>
       <thead><tr><th>ID</th><th>Title</th><th>Status</th><th>Complexity</th><th>Dependencies</th><th>Result</th></tr></thead>
       <tbody>${taskRows}</tbody>
     </table>
   </div>
-  <script>mermaid.initialize({startOnLoad:true,theme:'dark',flowchart:{curve:'basis',padding:20}})</script>
+
+  <div id="modal-backdrop">
+    <div id="modal">
+      <button id="modal-close" onclick="closeModal()">✕</button>
+      <div class="modal-title" id="m-title"></div>
+      <div class="modal-id" id="m-id"></div>
+      <div class="meta-row" id="m-meta"></div>
+      <div class="modal-section">
+        <div class="modal-label">Description</div>
+        <div class="modal-text" id="m-desc"></div>
+      </div>
+      <div class="modal-section" id="m-criteria-wrap">
+        <div class="modal-label">Completion Criteria</div>
+        <ul class="modal-list" id="m-criteria"></ul>
+      </div>
+      <div class="modal-section" id="m-tests-wrap">
+        <div class="modal-label">Tests</div>
+        <ul class="modal-list" id="m-tests"></ul>
+      </div>
+      <div class="modal-section" id="m-error-wrap">
+        <div class="modal-label" style="color:#f87171">Error</div>
+        <pre class="modal-result" id="m-error" style="color:#fca5a5;border-color:#7f1d1d"></pre>
+      </div>
+      <div class="modal-section" id="m-result-wrap">
+        <div class="modal-label">Result</div>
+        <div class="modal-result" id="m-result"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const TASKS = ${JSON.stringify(taskData)}
+    function escHtml(s){return(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+    function openModal(id){
+      const t=TASKS[id]; if(!t) return
+      document.getElementById('m-title').textContent=t.title
+      document.getElementById('m-id').textContent=t.id
+      const sc={pending:'#374151;color:#d1d5db',running:'#1d4ed8;color:#fff',completed:'#15803d;color:#fff',failed:'#b91c1c;color:#fff',skipped:'#a16207;color:#fff'}[t.status]??'#374151;color:#d1d5db'
+      const cc={low:'pill-low',medium:'pill-medium',high:'pill-high'}[t.complexity]??'pill-low'
+      document.getElementById('m-meta').innerHTML=[
+        \`<div class="meta-chip"><strong>Status</strong><span style="background:\${sc};padding:2px 8px;border-radius:999px;font-size:.75rem;font-weight:600">\${t.status}</span></div>\`,
+        \`<div class="meta-chip"><strong>Complexity</strong><span class="pill \${cc}">\${t.complexity}</span></div>\`,
+        t.docker_image?\`<div class="meta-chip"><strong>Docker Image</strong>\${escHtml(t.docker_image)}</div>\`:'',
+        t.dependencies.length?\`<div class="meta-chip"><strong>Depends on</strong>\${t.dependencies.join(', ')}</div>\`:'',
+      ].join('')
+      document.getElementById('m-desc').innerHTML=marked.parse(t.description||'—')
+      const cw=document.getElementById('m-criteria-wrap')
+      if(t.completion_criteria.length){document.getElementById('m-criteria').innerHTML=t.completion_criteria.map(c=>\`<li>\${marked.parseInline(c)}</li>\`).join('');cw.style.display=''}else{cw.style.display='none'}
+      const tw=document.getElementById('m-tests-wrap')
+      if(t.tests.length){document.getElementById('m-tests').innerHTML=t.tests.map(x=>\`<li>\${marked.parseInline(x)}</li>\`).join('');tw.style.display=''}else{tw.style.display='none'}
+      const ew=document.getElementById('m-error-wrap')
+      if(t.error){document.getElementById('m-error').textContent=t.error;ew.style.display=''}else{ew.style.display='none'}
+      const rw=document.getElementById('m-result-wrap')
+      if(t.result){document.getElementById('m-result').innerHTML=marked.parse(t.result);rw.style.display=''}else{rw.style.display='none'}
+      document.getElementById('modal-backdrop').classList.add('open')
+    }
+    function closeModal(){document.getElementById('modal-backdrop').classList.remove('open')}
+    document.getElementById('modal-backdrop').addEventListener('click',e=>{if(e.target===document.getElementById('modal-backdrop'))closeModal()})
+    document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal()})
+    document.querySelectorAll('tr[data-task-id]').forEach(r=>r.addEventListener('click',()=>openModal(r.dataset.taskId)))
+  </script>
 </body></html>`
 }
 
@@ -885,8 +1175,12 @@ sweBench
   .option('--output <path>', 'Output predictions JSON file', 'predictions.json')
   .option('--concurrency <n>', 'Number of instances to run in parallel', (v) => parseInt(v, 10), 1)
   .option('--timeout <ms>', 'Timeout per instance in ms', (v) => parseInt(v, 10), 600_000)
+  .option('--rounds <n>', 'Max reinforcement rounds per instance', (v) => parseInt(v, 10), 3)
+  .option('--verbose', 'Stream Claude output for each instance')
+  .option('--viz', 'Print a terminal DAG visualization after each round is planned')
   .action(async (opts) => {
     const { runSweBench } = await import('./swe-bench/runner.js')
+    const { terminalViz } = await import('./viz.js')
     try {
       await runSweBench({
         dataset:     opts.dataset,
@@ -895,6 +1189,11 @@ sweBench
         output:      opts.output,
         concurrency: opts.concurrency,
         timeout:     opts.timeout,
+        maxRounds:   opts.rounds,
+        verbose:     opts.verbose ?? false,
+        onPlanned:   opts.viz
+          ? (round, total, session) => terminalViz(session, { label: `Round ${round}/${total}`, hint: true })
+          : null,
       })
     } catch (err) {
       fail(`swe-bench run failed: ${err.message}`)

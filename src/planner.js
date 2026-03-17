@@ -1,15 +1,10 @@
-import Anthropic from '@anthropic-ai/sdk'
-
-let _client = null
-function getClient() {
-  if (!_client) _client = new Anthropic()
-  return _client
-}
-/** Override the Anthropic client — used by tests. */
-export function _setClient(c) { _client = c }
+import { readFileSync, existsSync } from 'fs'
+import { join } from 'path'
+import { client, MODELS, _setClient } from './client.js'
+export { _setClient }
 
 // JSON Schema for the DAG plan — used as structured output
-const PLAN_SCHEMA = {
+export const PLAN_SCHEMA = {
   type: 'object',
   properties: {
     tasks: {
@@ -100,6 +95,7 @@ const PLAN_SCHEMA = {
           poll_interval_seconds: { type: 'integer', description: 'wait: seconds between polls (default 5).' },
         },
         required: ['id', 'title', 'description', 'dependencies', 'complexity', 'docker_image', 'completion_criteria', 'tests', 'input_paths', 'output_paths'],
+        additionalProperties: false,
       },
     },
   },
@@ -112,16 +108,9 @@ const PLAN_SCHEMA = {
  * Returns an array of task objects ready to be stored in state.
  */
 export async function planDAG(goal, onThinking) {
-  const response = await getClient().messages.create({
-    model: 'claude-opus-4-6',
-    max_tokens: 8192,
-    thinking: { type: 'adaptive' },
-    output_config: {
-      format: {
-        type: 'json_schema',
-        schema: PLAN_SCHEMA,
-      },
-    },
+  const response = await client.messages.create({
+    model: MODELS.high,
+    max_tokens: 16000,
     system: `You are a senior software architect who breaks complex goals into well-structured task DAGs.
 
 Rules for designing the DAG:
@@ -139,6 +128,8 @@ For each task also provide:
 - tests: 1–3 shell commands that can be run inside the container to validate the task output
 - input_paths: repo-relative paths this task reads (will be mounted read-only); use ["."] if the whole repo is needed for context
 - output_paths: repo-relative paths this task creates or modifies (will be mounted read-write); be specific — list files, not the whole repo root`,
+    tools: [{ name: 'submit_plan', description: 'Submit the complete task DAG plan.', input_schema: PLAN_SCHEMA }],
+    tool_choice: { type: 'tool', name: 'submit_plan' },
     messages: [
       {
         role: 'user',
@@ -154,10 +145,10 @@ For each task also provide:
     }
   }
 
-  const text = response.content.find(b => b.type === 'text')?.text
-  if (!text) throw new Error('Planner returned no text block')
+  const toolBlock = response.content.find(b => b.type === 'tool_use' && b.name === 'submit_plan')
+  if (!toolBlock) throw new Error('Planner returned no submit_plan tool call')
 
-  const plan = JSON.parse(text)
+  const plan = toolBlock.input
 
   // Validate references
   const ids = new Set(plan.tasks.map(t => t.id))
@@ -170,6 +161,50 @@ For each task also provide:
   }
 
   return plan.tasks
+}
+
+/**
+ * Detect the Python version constraint from a repo's config files.
+ * Returns a docker image tag like "python:3.11-slim", or null if not detectable.
+ *
+ * Checks (in order):
+ *   .python-version       — exact version line, e.g. "3.10.4"
+ *   pyproject.toml        — requires-python = ">=3.10"
+ *   setup.cfg             — python_requires = >=3.9
+ *   tox.ini / .travis.yml — python: 3.x lines
+ */
+function detectPythonImage(repoPath) {
+  if (!repoPath) return null
+
+  // .python-version (pyenv/mise)
+  const pvFile = join(repoPath, '.python-version')
+  if (existsSync(pvFile)) {
+    const ver = readFileSync(pvFile, 'utf8').trim().split('\n')[0]
+    const m = ver.match(/^(\d+)\.(\d+)/)
+    if (m) return `python:${m[1]}.${m[2]}-slim`
+  }
+
+  // pyproject.toml — requires-python
+  const ppFile = join(repoPath, 'pyproject.toml')
+  if (existsSync(ppFile)) {
+    const content = readFileSync(ppFile, 'utf8')
+    const m = content.match(/requires-python\s*=\s*["'][><=!~^]*\s*(\d+)\.(\d+)/)
+    if (m) return `python:${m[1]}.${m[2]}-slim`
+  }
+
+  // setup.cfg — python_requires
+  const scFile = join(repoPath, 'setup.cfg')
+  if (existsSync(scFile)) {
+    const content = readFileSync(scFile, 'utf8')
+    const m = content.match(/python_requires\s*=\s*[><=!~^]*\s*(\d+)\.(\d+)/)
+    if (m) return `python:${m[1]}.${m[2]}-slim`
+  }
+
+  // package.json → Node repo, not Python
+  if (existsSync(join(repoPath, 'package.json'))) return null
+
+  // Default to a recent but not bleeding-edge Python for broad compatibility
+  return 'python:3.11-slim'
 }
 
 /**
@@ -200,6 +235,13 @@ export async function planSWE(issueText, localizationReport, repoPath) {
   const testContext = (test_files ?? []).join(', ') || 'unknown'
   const failingContext = (failing_tests ?? []).join('\n') || 'run the test suite to find out'
 
+  // Detect the required Python/Node version from the repo so the planner
+  // picks a docker_image that actually has the right runtime.
+  const detectedImage = detectPythonImage(repoPath)
+  const imageHint = detectedImage
+    ? `\n**Detected runtime:** Use \`${detectedImage}\` as docker_image for all tasks (detected from repo config).`
+    : ''
+
   const prompt = `Fix the following issue in the repository at ${repoPath}.
 
 ## Issue
@@ -219,37 +261,39 @@ ${functionsContext || '(none identified)'}
 **Test files:** ${testContext}
 **Currently failing tests:**
 ${failingContext}
-
+${imageHint}
 ## Plan requirements
 Design a minimal, surgical fix plan with exactly this structure:
-1. task_1 [execute, complexity: high]: Apply the fix — edit only the localized files. Be surgical.
-2. task_2 [while, max_iterations: 5]: Test-fix loop — run tests, fix failures, repeat until green.
-   - body task (task_fix) [execute]: Read failing test output and patch the code.
-   - condition: "exit: <test command that exits 0 when all tests pass>"
-3. task_3 [execute, complexity: low]: Write a brief summary of what was changed and why.
+1. task_env [execute, complexity: low]: Install the repo's test dependencies so tests can actually run.
+   - Detect the package manager: pip (pyproject.toml/setup.cfg/requirements.txt), npm (package.json), etc.
+   - Run the install command (e.g. pip install -e ".[test]", npm ci, pip install -r requirements.txt).
+   - input_paths: ["."], output_paths: [] (no source files modified).
+2. task_fix [execute, complexity: high, depends on task_env]: Apply the fix — edit only the localized files. Be surgical.
+   - Use str_replace for targeted edits; only use write_file for new files.
+3. task_loop [while, max_iterations: 5, depends on task_fix]: Test-fix loop — run tests, fix failures, repeat until green.
+   - body task (task_loop_body) [execute]: Read failing test output and patch the code with str_replace.
+   - condition: "exit: ! <test command>" — IMPORTANT: prefix the test command with "! " so the condition
+     exits 0 (= true = keep looping) when tests FAIL, and exits non-zero (= false = stop looping) when tests PASS.
+     Example: "exit: ! python -m pytest tests/ -x -q"
+4. task_summary [execute, complexity: low, depends on task_loop]: Write a brief summary of what was changed and why.
 
 Set input_paths to the relevant files. Set output_paths to only the files that will be modified.
 Use the correct docker_image for this repo's language (detect from file extensions in the report).`
 
-  const response = await getClient().messages.create({
-    model: 'claude-opus-4-6',
-    max_tokens: 4096,
-    thinking: { type: 'adaptive' },
-    output_config: {
-      format: {
-        type: 'json_schema',
-        schema: PLAN_SCHEMA,
-      },
-    },
+  const response = await client.messages.create({
+    model: MODELS.high,
+    max_tokens: 16000,
     system: `You are an expert software engineer creating a minimal, surgical fix plan.
 Focus: apply the smallest possible change that fixes the issue. Do not refactor or clean up unrelated code.`,
+    tools: [{ name: 'submit_plan', description: 'Submit the complete task DAG plan.', input_schema: PLAN_SCHEMA }],
+    tool_choice: { type: 'tool', name: 'submit_plan' },
     messages: [{ role: 'user', content: prompt }],
   })
 
-  const text = response.content.find(b => b.type === 'text')?.text
-  if (!text) throw new Error('SWE planner returned no text block')
+  const toolBlock = response.content.find(b => b.type === 'tool_use' && b.name === 'submit_plan')
+  if (!toolBlock) throw new Error('SWE planner returned no submit_plan tool call')
 
-  const plan = JSON.parse(text)
+  const plan = toolBlock.input
 
   const ids = new Set(plan.tasks.map(t => t.id))
   for (const task of plan.tasks) {

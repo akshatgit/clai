@@ -2,24 +2,21 @@ import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { executeTask, _setClient, COMPLEXITY_MODEL_MAP } from '../src/executor.js'
 
-// ─── Mock streaming client ────────────────────────────────────────────────────
+// ─── Mock client ──────────────────────────────────────────────────────────────
 
 /**
- * Returns a mock Anthropic client whose stream() yields the given text as a
- * single text_delta event, then calls finalMessage().
+ * Returns a mock Anthropic client whose create() immediately returns
+ * a single text block with stop_reason 'end_turn'.
  * Pass an Error instance to simulate an API failure.
  */
 function mockClient(textOrError) {
   return {
     messages: {
-      stream(params) {
+      create(params) {
         if (textOrError instanceof Error) throw textOrError
-        const text = textOrError
         return {
-          [Symbol.asyncIterator]: async function* () {
-            yield { type: 'content_block_delta', delta: { type: 'text_delta', text } }
-          },
-          finalMessage: async () => ({}),
+          content: [{ type: 'text', text: textOrError }],
+          stop_reason: 'end_turn',
         }
       },
     },
@@ -62,14 +59,9 @@ describe('model selection', () => {
       let usedModel
       _setClient({
         messages: {
-          stream(params) {
+          create(params) {
             usedModel = params.model
-            return {
-              [Symbol.asyncIterator]: async function* () {
-                yield { type: 'content_block_delta', delta: { type: 'text_delta', text: '## Summary\nDone.' } }
-              },
-              finalMessage: async () => ({}),
-            }
+            return { content: [{ type: 'text', text: '## Summary\nDone.' }], stop_reason: 'end_turn' }
           },
         },
       })
@@ -82,14 +74,9 @@ describe('model selection', () => {
     let usedModel
     _setClient({
       messages: {
-        stream(params) {
+        create(params) {
           usedModel = params.model
-          return {
-            [Symbol.asyncIterator]: async function* () {
-              yield { type: 'content_block_delta', delta: { type: 'text_delta', text: '## Summary\nDone.' } }
-            },
-            finalMessage: async () => ({}),
-          }
+          return { content: [{ type: 'text', text: '## Summary\nDone.' }], stop_reason: 'end_turn' }
         },
       },
     })
@@ -101,43 +88,41 @@ describe('model selection', () => {
 // ─── Return value ─────────────────────────────────────────────────────────────
 
 describe('return value', () => {
-  it('returns the full streamed text', async () => {
+  it('returns the full text from a single text block', async () => {
     _setClient(mockClient('hello world'))
     const result = await executeTask(session(), task())
     assert.equal(result, 'hello world')
   })
 
-  it('concatenates multiple text chunks', async () => {
+  it('joins multiple text blocks with newline', async () => {
     _setClient({
       messages: {
-        stream() {
+        create() {
           return {
-            [Symbol.asyncIterator]: async function* () {
-              yield { type: 'content_block_delta', delta: { type: 'text_delta', text: 'foo' } }
-              yield { type: 'content_block_delta', delta: { type: 'text_delta', text: 'bar' } }
-              yield { type: 'content_block_delta', delta: { type: 'text_delta', text: 'baz' } }
-            },
-            finalMessage: async () => ({}),
+            content: [
+              { type: 'text', text: 'foo' },
+              { type: 'text', text: 'bar' },
+              { type: 'text', text: 'baz' },
+            ],
+            stop_reason: 'end_turn',
           }
         },
       },
     })
     const result = await executeTask(session(), task())
-    assert.equal(result, 'foobarbaz')
+    assert.equal(result, 'foo\nbar\nbaz')
   })
 
-  it('ignores non-text_delta events', async () => {
+  it('ignores non-text blocks (thinking, tool_use)', async () => {
     _setClient({
       messages: {
-        stream() {
+        create() {
           return {
-            [Symbol.asyncIterator]: async function* () {
-              yield { type: 'content_block_start', index: 0 }
-              yield { type: 'content_block_delta', delta: { type: 'text_delta', text: 'real' } }
-              yield { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'ignore me' } }
-              yield { type: 'message_delta', usage: {} }
-            },
-            finalMessage: async () => ({}),
+            content: [
+              { type: 'thinking', thinking: 'ignore me' },
+              { type: 'text', text: 'real' },
+            ],
+            stop_reason: 'end_turn',
           }
         },
       },
@@ -145,21 +130,44 @@ describe('return value', () => {
     const result = await executeTask(session(), task())
     assert.equal(result, 'real')
   })
-})
 
-// ─── onChunk streaming ────────────────────────────────────────────────────────
-
-describe('onChunk callback', () => {
-  it('calls onChunk for each text chunk as it arrives', async () => {
+  it('collects text across multiple agentic loop turns', async () => {
+    let call = 0
     _setClient({
       messages: {
-        stream() {
+        create() {
+          call++
+          if (call === 1) {
+            return {
+              content: [
+                { type: 'text', text: 'thinking...' },
+                { type: 'tool_use', id: 'tu_1', name: 'run_command', input: { command: 'echo hi' } },
+              ],
+              stop_reason: 'tool_use',
+            }
+          }
+          return { content: [{ type: 'text', text: 'done' }], stop_reason: 'end_turn' }
+        },
+      },
+    })
+    const result = await executeTask(session(), task())
+    assert.equal(result, 'thinking...\ndone')
+  })
+})
+
+// ─── onChunk callback ─────────────────────────────────────────────────────────
+
+describe('onChunk callback', () => {
+  it('calls onChunk for each text block', async () => {
+    _setClient({
+      messages: {
+        create() {
           return {
-            [Symbol.asyncIterator]: async function* () {
-              yield { type: 'content_block_delta', delta: { type: 'text_delta', text: 'chunk1' } }
-              yield { type: 'content_block_delta', delta: { type: 'text_delta', text: 'chunk2' } }
-            },
-            finalMessage: async () => ({}),
+            content: [
+              { type: 'text', text: 'chunk1' },
+              { type: 'text', text: 'chunk2' },
+            ],
+            stop_reason: 'end_turn',
           }
         },
       },
@@ -167,6 +175,28 @@ describe('onChunk callback', () => {
     const chunks = []
     await executeTask(session(), task(), c => chunks.push(c))
     assert.deepEqual(chunks, ['chunk1', 'chunk2'])
+  })
+
+  it('calls onChunk for tool_use blocks with tool name', async () => {
+    let call = 0
+    _setClient({
+      messages: {
+        create() {
+          call++
+          if (call === 1) {
+            return {
+              content: [{ type: 'tool_use', id: 'tu_1', name: 'write_file', input: { path: '/workspace/x', content: 'y' } }],
+              stop_reason: 'tool_use',
+            }
+          }
+          return { content: [], stop_reason: 'end_turn' }
+        },
+      },
+    })
+    const chunks = []
+    await executeTask(session(), task(), c => chunks.push(c))
+    // onChunk called for tool invocation and for tool result
+    assert.ok(chunks.some(c => c.includes('write_file')))
   })
 
   it('works fine when onChunk is not provided', async () => {
@@ -182,14 +212,9 @@ describe('prompt content', () => {
   beforeEach(() => {
     _setClient({
       messages: {
-        stream(params) {
+        create(params) {
           capturedPrompt = params.messages[0].content
-          return {
-            [Symbol.asyncIterator]: async function* () {
-              yield { type: 'content_block_delta', delta: { type: 'text_delta', text: '## Summary\nDone.' } }
-            },
-            finalMessage: async () => ({}),
-          }
+          return { content: [{ type: 'text', text: '## Summary\nDone.' }], stop_reason: 'end_turn' }
         },
       },
     })
@@ -247,22 +272,24 @@ describe('prompt content', () => {
 // ─── Error propagation ────────────────────────────────────────────────────────
 
 describe('error propagation', () => {
-  it('propagates API errors thrown by stream()', async () => {
+  it('propagates API errors thrown by create()', async () => {
     _setClient(mockClient(new Error('API quota exceeded')))
     await assert.rejects(executeTask(session(), task()), /API quota exceeded/)
   })
 
-  it('propagates errors thrown inside the async iterator', async () => {
+  it('propagates errors thrown by create() in subsequent loop iterations', async () => {
+    let call = 0
     _setClient({
       messages: {
-        stream() {
-          return {
-            [Symbol.asyncIterator]: async function* () {
-              yield { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial' } }
-              throw new Error('stream interrupted')
-            },
-            finalMessage: async () => ({}),
+        create() {
+          call++
+          if (call === 1) {
+            return {
+              content: [{ type: 'tool_use', id: 'tu_1', name: 'run_command', input: { command: 'echo hi' } }],
+              stop_reason: 'tool_use',
+            }
           }
+          throw new Error('stream interrupted')
         },
       },
     })

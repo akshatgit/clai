@@ -83,25 +83,23 @@ afterEach(() => {
 // ─── containerName ────────────────────────────────────────────────────────────
 
 describe('containerName', () => {
-  it('produces a name containing both sessionId and taskId', () => {
+  it('contains the sessionId', () => {
     const name = containerName('sess_abc', 'task_1')
     assert.ok(name.includes('sess_abc'))
-    assert.ok(name.includes('task_1'))
+  })
+
+  it('is session-scoped — same name for different tasks in the same session', () => {
+    // All tasks in a session share one container so env installs persist
+    assert.equal(containerName('sess_aaa', 'task_1'), containerName('sess_aaa', 'task_2'))
   })
 
   it('varies with sessionId', () => {
     assert.notEqual(containerName('sess_aaa', 'task_1'), containerName('sess_bbb', 'task_1'))
   })
 
-  it('varies with taskId', () => {
-    assert.notEqual(containerName('sess_aaa', 'task_1'), containerName('sess_aaa', 'task_2'))
-  })
-
   it('starts with the expected prefix', () => {
-    // containerName returns `clai-${sessionId}-${taskId}` (project prefix)
     const name = containerName('sess_xyz', 'task_3')
-    assert.ok(name.startsWith('clai-') || name.startsWith('orchestrator-'),
-      `unexpected prefix: ${name}`)
+    assert.ok(name.startsWith('clai-'), `unexpected prefix: ${name}`)
   })
 
   it('is consistent (same inputs → same output)', () => {
@@ -110,32 +108,23 @@ describe('containerName', () => {
 })
 
 // ─── runTaskInDocker — spawn call sequence ────────────────────────────────────
+//
+// ensureSessionContainer uses execSync (not _spawn) for `docker inspect`.
+// In tests, inspect throws (no real container) → catch falls through to run -d.
+// When container doesn't exist: [0] docker run -d, [1] docker exec
+// When container exists but stopped: [0] docker rm -f, [1] docker run -d, [2] docker exec
 
 describe('runTaskInDocker — container lifecycle', () => {
-  it('first spawn call is docker rm -f (cleanup previous container)', async () => {
+  it('first spawn call is docker run -d when container does not exist', async () => {
     const s = session()
     const t = task()
     writeFileSync(join(sessionsDir, `.result-${s.id}-${t.id}`), 'output')
 
-    const mock = spawnSequence(fakeProc(0), fakeProc(0), fakeProc(0))
+    const mock = spawnSequence(fakeProc(0), fakeProc(0))
     _setSpawn(mock)
 
     await runTaskInDocker(s, t, () => {})
-    assert.equal(mock.calls[0].args[0], 'rm')
-    assert.ok(mock.calls[0].args.includes('-f'))
-    assert.ok(mock.calls[0].args.includes(containerName(s.id, t.id)))
-  })
-
-  it('second spawn call is docker run -d with the container name', async () => {
-    const s = session()
-    const t = task()
-    writeFileSync(join(sessionsDir, `.result-${s.id}-${t.id}`), 'output')
-
-    const mock = spawnSequence(fakeProc(0), fakeProc(0), fakeProc(0))
-    _setSpawn(mock)
-
-    await runTaskInDocker(s, t, () => {})
-    const args = mock.calls[1].args
+    const args = mock.calls[0].args
     assert.equal(args[0], 'run')
     assert.ok(args.includes('-d'))
     assert.ok(args.includes('--name'))
@@ -147,36 +136,38 @@ describe('runTaskInDocker — container lifecycle', () => {
     const t = task('task_1', { docker_image: 'python:3.12-slim' })
     writeFileSync(join(sessionsDir, `.result-${s.id}-${t.id}`), 'output')
 
-    const mock = spawnSequence(fakeProc(0), fakeProc(0), fakeProc(0))
+    const mock = spawnSequence(fakeProc(0), fakeProc(0))
     _setSpawn(mock)
 
     await runTaskInDocker(s, t, () => {})
-    assert.ok(mock.calls[1].args.includes('python:3.12-slim'))
+    assert.ok(mock.calls[0].args.includes('python:3.12-slim'))
   })
 
-  it('mounts repoPath at /workspace when provided', async () => {
+  it('mounts repoPath at /workspace read-write when provided', async () => {
     const s = session()
     const t = task()
     writeFileSync(join(sessionsDir, `.result-${s.id}-${t.id}`), 'output')
 
-    const mock = spawnSequence(fakeProc(0), fakeProc(0), fakeProc(0))
+    const mock = spawnSequence(fakeProc(0), fakeProc(0))
     _setSpawn(mock)
 
     await runTaskInDocker(s, t, () => {}, { repoPath: '/my/project' })
-    const runArgs = mock.calls[1].args.join(' ')
+    const runArgs = mock.calls[0].args.join(' ')
+    // RW mount (no :ro suffix) so all tasks can write freely
     assert.ok(runArgs.includes('/my/project:/workspace'))
+    assert.ok(!runArgs.includes('/my/project:/workspace:ro'), 'workspace should not be read-only')
   })
 
-  it('third spawn call is docker exec with correct session and task ids', async () => {
+  it('second spawn call is docker exec with correct session and task ids', async () => {
     const s = session('sess_xyz')
     const t = task('task_2')
     writeFileSync(join(sessionsDir, `.result-${s.id}-${t.id}`), 'the result')
 
-    const mock = spawnSequence(fakeProc(0), fakeProc(0), fakeProc(0, { stderrChunks: ['the result'] }))
+    const mock = spawnSequence(fakeProc(0), fakeProc(0, { stderrChunks: ['the result'] }))
     _setSpawn(mock)
 
     await runTaskInDocker(s, t, () => {})
-    const execArgs = mock.calls[2].args
+    const execArgs = mock.calls[1].args
     assert.equal(execArgs[0], 'exec')
     assert.ok(execArgs.includes('sess_xyz'))
     assert.ok(execArgs.includes('task_2'))
@@ -191,7 +182,7 @@ describe('runTaskInDocker — result handling', () => {
     const t = task()
     writeFileSync(join(sessionsDir, `.result-${s.id}-${t.id}`), '## Summary\nScaffolded the project.')
 
-    _setSpawn(spawnSequence(fakeProc(0), fakeProc(0), fakeProc(0)))
+    _setSpawn(spawnSequence(fakeProc(0), fakeProc(0)))
     const result = await runTaskInDocker(s, t, () => {})
     assert.ok(result.includes('Scaffolded the project.'))
   })
@@ -203,9 +194,8 @@ describe('runTaskInDocker — result handling', () => {
 
     const chunks = []
     _setSpawn(spawnSequence(
-      fakeProc(0),
-      fakeProc(0),
-      fakeProc(0, { stderrChunks: ['chunk-a', 'chunk-b'] }),
+      fakeProc(0),                                          // docker run -d
+      fakeProc(0, { stderrChunks: ['chunk-a', 'chunk-b'] }),  // docker exec
     ))
     await runTaskInDocker(s, t, c => chunks.push(c))
     assert.ok(chunks.some(c => c.includes('chunk-a')))
@@ -215,7 +205,7 @@ describe('runTaskInDocker — result handling', () => {
   it('rejects when the worker container exits non-zero', async () => {
     const s = session()
     const t = task()
-    _setSpawn(spawnSequence(fakeProc(0), fakeProc(0), fakeProc(1)))
+    _setSpawn(spawnSequence(fakeProc(0), fakeProc(1)))  // run-d ok, exec fails
 
     await assert.rejects(
       runTaskInDocker(s, t, () => {}),
@@ -227,7 +217,7 @@ describe('runTaskInDocker — result handling', () => {
     const s = session()
     const t = task()
     // intentionally no result file
-    _setSpawn(spawnSequence(fakeProc(0), fakeProc(0), fakeProc(0)))
+    _setSpawn(spawnSequence(fakeProc(0), fakeProc(0)))
 
     await assert.rejects(
       runTaskInDocker(s, t, () => {}),

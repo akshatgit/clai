@@ -1,6 +1,6 @@
 import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { planDAG, _setClient } from '../src/planner.js'
+import { planDAG, _setClient, PLAN_SCHEMA } from '../src/planner.js'
 
 // ─── Mock helpers ─────────────────────────────────────────────────────────────
 
@@ -89,10 +89,6 @@ describe('planDAG — happy path', () => {
     assert.equal(lastParams.model, 'claude-opus-4-6')
   })
 
-  it('sends adaptive thinking config', async () => {
-    await planDAG('goal')
-    assert.deepEqual(lastParams.thinking, { type: 'adaptive' })
-  })
 
   it('includes the goal in the user message', async () => {
     await planDAG('my specific goal string')
@@ -182,5 +178,26 @@ describe('planDAG — error propagation', () => {
   it('propagates network-style errors', async () => {
     _setClient({ messages: { create: async () => { throw new Error('ECONNREFUSED') } } })
     await assert.rejects(planDAG('goal'), /ECONNREFUSED/)
+  })
+})
+
+// ─── Schema validation ────────────────────────────────────────────────────────
+
+describe('PLAN_SCHEMA', () => {
+  function checkAdditionalProperties(schema, path = 'PLAN_SCHEMA') {
+    if (schema.type === 'object') {
+      assert.equal(
+        schema.additionalProperties, false,
+        `${path} is missing additionalProperties: false — Anthropic API will reject it`
+      )
+    }
+    for (const [key, child] of Object.entries(schema.properties ?? {})) {
+      checkAdditionalProperties(child, `${path}.${key}`)
+    }
+    if (schema.items) checkAdditionalProperties(schema.items, `${path}[]`)
+  }
+
+  it('every object type has additionalProperties: false', () => {
+    checkAdditionalProperties(PLAN_SCHEMA)
   })
 })

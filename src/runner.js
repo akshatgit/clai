@@ -9,6 +9,7 @@ import { loadSession, saveSession, resetTask } from './state.js'
 import { emit } from './hooks.js'
 import { getReadyTasks, getBlockedTasks, getStats } from './dag.js'
 import { executeTask as _defaultExecutor } from './executor.js'
+import { runTaskInDocker } from './docker.js'
 import { executeBranch } from './task-types/branch.js'
 import { executeBarrier, BARRIER_PENDING } from './task-types/barrier.js'
 import { executeForEach } from './task-types/for-each.js'
@@ -22,15 +23,21 @@ export function _resetExecutor() { _executor = _defaultExecutor }
 
 /**
  * Dispatch to the correct handler based on task.type.
- * _executor is only used for 'execute' tasks, so test mocks remain scoped.
+ * dockerOpts = { useDocker, repoPath } — passed down to executeWhile so the
+ * condition evaluator can run shell conditions inside the right container.
  */
-async function dispatchTask(session, task, onChunk) {
+async function dispatchTask(session, task, onChunk, dockerOpts = {}) {
+  const { useDocker = false, repoPath = null } = dockerOpts
   const type = task.type ?? 'execute'
+
   switch (type) {
-    case 'execute':  return _executor(session, task, onChunk)
+    case 'execute':
+      if (useDocker) return runTaskInDocker(session, task, onChunk, { repoPath })
+      return _executor(session, task, onChunk)
+
     case 'branch':   return executeBranch(session, task, onChunk)
     case 'for_each': return executeForEach(session, task, onChunk)
-    case 'while':    return executeWhile(session, task, onChunk)
+    case 'while':    return executeWhile(session, task, onChunk, dockerOpts)
     case 'barrier':  return executeBarrier(session, task, onChunk)
     case 'wait':     return executeWait(session, task, onChunk)
     default: throw new Error(`Unknown task type: "${type}"`)
@@ -41,15 +48,17 @@ async function dispatchTask(session, task, onChunk) {
  * Run all pending tasks in a session (topological order), or re-run one task.
  *
  * @param {object} session
- * @param {{ verbose?: boolean, targetTaskId?: string, onChunk?: Function }} opts
+ * @param {{ verbose?: boolean, targetTaskId?: string, onChunk?: Function,
+ *           useDocker?: boolean, repoPath?: string }} opts
  */
 export async function runSessionTasks(session, opts = {}) {
-  const { verbose = false, targetTaskId = null, onChunk } = opts
+  const { verbose = false, targetTaskId = null, onChunk, useDocker = false, repoPath = null } = opts
+  const dockerOpts = { useDocker, repoPath }
 
   if (targetTaskId) {
     resetTask(session, targetTaskId)
     session = loadSession(session.id)
-    await runSingleTask(session, targetTaskId, { onChunk: verbose ? onChunk : null })
+    await runSingleTask(session, targetTaskId, { onChunk: verbose ? onChunk : null, ...dockerOpts })
     return
   }
 
@@ -64,23 +73,28 @@ export async function runSessionTasks(session, opts = {}) {
   while (true) {
     session = loadSession(session.id)
 
-    // Mark tasks blocked by failed/skipped dependencies
-    const blocked = getBlockedTasks(session.dag.tasks)
-    for (const id of blocked) {
-      session.dag.tasks[id].status = 'skipped'
-      emit('task:skipped', {
-        sessionId: session.id,
-        taskId: id,
-        taskTitle: session.dag.tasks[id].title,
-        reason: 'dependency failed or skipped',
-      })
-    }
-    if (blocked.length > 0) saveSession(session)
+    // Propagate skips transitively — one pass only catches direct deps,
+    // so loop until no new tasks are blocked (e.g. A→B→C: C only appears
+    // after B is already marked skipped)
+    let blocked
+    do {
+      blocked = getBlockedTasks(session.dag.tasks)
+      for (const id of blocked) {
+        session.dag.tasks[id].status = 'skipped'
+        emit('task:skipped', {
+          sessionId: session.id,
+          taskId: id,
+          taskTitle: session.dag.tasks[id].title,
+          reason: 'dependency failed or skipped',
+        })
+      }
+      if (blocked.length > 0) saveSession(session)
+    } while (blocked.length > 0)
 
     const ready = getReadyTasks(session.dag.tasks, session.dag.order)
     if (ready.length === 0) break
 
-    await runSingleTask(session, ready[0], { onChunk: verbose ? onChunk : null })
+    await runSingleTask(session, ready[0], { onChunk: verbose ? onChunk : null, ...dockerOpts })
   }
 
   session = loadSession(session.id)
@@ -105,10 +119,11 @@ export async function runSessionTasks(session, opts = {}) {
  *
  * @param {object} session
  * @param {string} taskId
- * @param {{ onChunk?: Function }} opts
+ * @param {{ onChunk?: Function, useDocker?: boolean, repoPath?: string }} opts
  */
 export async function runSingleTask(session, taskId, opts = {}) {
-  const { onChunk } = opts
+  const { onChunk, useDocker = false, repoPath = null } = opts
+  const dockerOpts = { useDocker, repoPath }
 
   // Reload to ensure we have latest state (prev task may have updated session)
   session = loadSession(session.id)
@@ -129,7 +144,7 @@ export async function runSingleTask(session, taskId, opts = {}) {
   const taskStart = Date.now()
 
   try {
-    const result = await dispatchTask(session, task, onChunk ?? null)
+    const result = await dispatchTask(session, task, onChunk ?? null, dockerOpts)
 
     // Barrier not ready — reset to pending and return silently
     if (result === BARRIER_PENDING) {
@@ -160,6 +175,7 @@ export async function runSingleTask(session, taskId, opts = {}) {
     session = loadSession(session.id)
     session.dag.tasks[taskId].status = 'failed'
     session.dag.tasks[taskId].completed_at = new Date().toISOString()
+    session.dag.tasks[taskId].error = err.message
     saveSession(session)
 
     emit('task:failed', {
