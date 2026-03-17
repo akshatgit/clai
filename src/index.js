@@ -2,6 +2,7 @@
 import { program } from 'commander'
 import { planDAG, planSWE } from './planner.js'
 import { localizeIssue } from './localize.js'
+import { reinforcedSWE } from './reinforce.js'
 import { executeTask } from './executor.js'
 import { runTaskInDocker, listTaskContainers, containerName } from './docker.js'
 import { createSession, loadSession, saveSession, listSessions, resetTask, LOGS_DIR } from './state.js'
@@ -936,94 +937,123 @@ sweBench
     console.log()
   })
 
-// SWE: localize an issue then plan + execute a focused fix
+// SWE: localize → plan → execute with reinforcement rounds
 program
   .command('swe <issue>')
-  .description('Localize a bug in a repo, plan a minimal fix, and execute it')
-  .option('--repo <path>', 'Path to the repository (defaults to cwd)')
-  .option('--docker', 'Run fix tasks in Docker containers')
-  .option('--plan-only', 'Stop after planning (do not execute)')
-  .option('--verbose', 'Stream Claude output live')
+  .description('Localize a bug, plan a surgical fix, and execute with reinforcement rounds')
+  .option('--repo <path>',    'Path to the repository (defaults to cwd)')
+  .option('--docker',         'Run fix tasks in Docker containers')
+  .option('--rounds <n>',     'Max outer reinforcement rounds (default 3)', '3')
+  .option('--plan-only',      'Stop after first localize+plan (do not execute)')
+  .option('--verbose',        'Stream Claude output live')
   .action(async (issue, opts) => {
     setupLoggingHooks()
     const repoPath = opts.repo ?? process.cwd()
-
-    // ── Step 1: Localize ──────────────────────────────────────────────────────
-    header('Localizing Issue')
-    info(`Repo: ${repoPath}`)
-    console.log(`${c.dim}${issue.slice(0, 120)}${c.reset}\n`)
-
-    let report
-    try {
-      report = await localizeIssue(issue, repoPath, chunk => {
-        if (opts.verbose) process.stdout.write(chunk)
-        else process.stdout.write('.')
-      })
-    } catch (err) {
-      fail(`Localization failed: ${err.message}`)
-      process.exit(1)
-    }
-
-    if (!opts.verbose) console.log()
-
-    header('Localization Report')
-    console.log(`  ${c.bold}Root cause:${c.reset} ${report.summary}`)
-    console.log(`  ${c.bold}Hypothesis:${c.reset} ${report.fix_hypothesis}`)
-    console.log()
-    console.log(`  ${c.bold}Relevant files:${c.reset}`)
-    for (const f of report.relevant_files ?? []) {
-      const lines = f.key_lines?.length ? ` ${c.dim}(lines: ${f.key_lines.join(', ')})${c.reset}` : ''
-      console.log(`    ${c.cyan}${f.path}${c.reset}${lines}`)
-      console.log(`    ${c.dim}${f.reason}${c.reset}`)
-    }
-    if (report.failing_tests?.length) {
-      console.log()
-      console.log(`  ${c.bold}Failing tests:${c.reset}`)
-      for (const t of report.failing_tests) console.log(`    ${c.red}${t}${c.reset}`)
-    }
-
-    // ── Step 2: Plan ──────────────────────────────────────────────────────────
-    console.log()
-    header('Planning Fix')
-    console.log(`${c.dim}Designing minimal fix plan…${c.reset}\n`)
-
-    let tasks
-    try {
-      tasks = await planSWE(issue, report, repoPath)
-    } catch (err) {
-      fail(`Planning failed: ${err.message}`)
-      process.exit(1)
-    }
-
-    const session = createSession(`[SWE] ${issue.slice(0, 80)}`, tasks)
-    // Attach the localization report to the session for executor context
-    session.localization = report
-    saveSession(session)
-
-    emit('session:created', { sessionId: session.id, goal: session.goal, taskCount: tasks.length })
-
-    header('Fix Plan')
-    for (const id of session.dag.order) {
-      const t = session.dag.tasks[id]
-      const deps = t.dependencies.length ? ` ${c.gray}← [${t.dependencies.join(', ')}]${c.reset}` : ''
-      const cx = t.complexity === 'high' ? c.red : t.complexity === 'medium' ? c.yellow : c.green
-      const typeBadge = t.type !== 'execute' ? ` ${c.magenta}[${t.type}]${c.reset}` : ''
-      console.log(`  ${icon.pending} ${c.bold}${id}${c.reset}  ${t.title}  ${cx}[${t.complexity}]${c.reset}${typeBadge}${deps}`)
-    }
-    console.log()
-    info(`Session ID: ${c.bold}${session.id}${c.reset}`)
+    const maxRounds = parseInt(opts.rounds, 10)
 
     if (opts.planOnly) {
+      // Single localize + plan, then exit
+      header('Localizing Issue')
+      info(`Repo: ${repoPath}`)
+
+      let report
+      try {
+        report = await localizeIssue(issue, repoPath, chunk => {
+          if (opts.verbose) process.stdout.write(chunk)
+          else process.stdout.write('.')
+        })
+      } catch (err) {
+        fail(`Localization failed: ${err.message}`)
+        process.exit(1)
+      }
+      if (!opts.verbose) console.log()
+      printLocalizationReport(report)
+
+      header('Planning Fix')
+      let tasks
+      try { tasks = await planSWE(issue, report, repoPath) }
+      catch (err) { fail(`Planning failed: ${err.message}`); process.exit(1) }
+
+      const session = createSession(`[SWE] ${issue.slice(0, 80)}`, tasks)
+      session.localization = report
+      saveSession(session)
+      emit('session:created', { sessionId: session.id, goal: session.goal, taskCount: tasks.length })
+      printPlan(session)
       info(`Run it: clai run ${session.id}${opts.docker ? ' --docker' : ''} --repo ${repoPath}`)
       return
     }
 
-    // ── Step 3: Execute ───────────────────────────────────────────────────────
-    await runSessionTasks(session, {
-      verbose: opts.verbose,
-      useDocker: opts.docker,
-      repoPath,
-    })
+    // Full reinforced run
+    header('SWE — Reinforced Fix')
+    info(`Issue: ${issue.slice(0, 100)}`)
+    info(`Repo:  ${repoPath}`)
+    info(`Rounds: up to ${maxRounds}`)
+    console.log()
+
+    let result
+    try {
+      result = await reinforcedSWE(issue, repoPath, {
+        maxRounds,
+        verbose: opts.verbose,
+        useDocker: opts.docker,
+        onChunk: chunk => {
+          if (opts.verbose) process.stdout.write(chunk)
+          else process.stdout.write('.')
+        },
+        onRound: (round, total) => {
+          if (!opts.verbose) console.log()
+          header(`Round ${round} / ${total}`)
+        },
+        onLocalized: (round, report) => {
+          printLocalizationReport(report)
+        },
+        onPlanned: (round, session) => {
+          printPlan(session)
+        },
+      })
+    } catch (err) {
+      fail(`SWE failed: ${err.message}`)
+      process.exit(1)
+    }
+
+    if (!opts.verbose) console.log()
+    header('Result')
+    if (result.success) {
+      success(`Fixed in ${result.rounds} round${result.rounds > 1 ? 's' : ''}`)
+    } else {
+      fail(`Could not fix after ${result.rounds} rounds`)
+    }
+    console.log()
+    console.log(`${c.dim}${result.finalOutput?.slice(0, 600) ?? ''}${c.reset}`)
+    info(`Sessions: ${result.sessions.join(', ')}`)
   })
+
+function printLocalizationReport(report) {
+  console.log(`\n  ${c.bold}Root cause:${c.reset}  ${report.summary}`)
+  console.log(`  ${c.bold}Hypothesis:${c.reset}  ${report.fix_hypothesis}`)
+  console.log(`\n  ${c.bold}Relevant files:${c.reset}`)
+  for (const f of report.relevant_files ?? []) {
+    const lines = f.key_lines?.length ? ` ${c.dim}(lines ${f.key_lines.join(', ')})${c.reset}` : ''
+    console.log(`    ${c.cyan}${f.path}${c.reset}${lines}  ${c.dim}${f.reason}${c.reset}`)
+  }
+  if (report.failing_tests?.length) {
+    console.log(`\n  ${c.bold}Failing tests:${c.reset}`)
+    for (const t of report.failing_tests) console.log(`    ${c.red}✗ ${t}${c.reset}`)
+  }
+  console.log()
+}
+
+function printPlan(session) {
+  console.log()
+  for (const id of session.dag.order) {
+    const t = session.dag.tasks[id]
+    const deps = t.dependencies.length ? ` ${c.gray}← [${t.dependencies.join(', ')}]${c.reset}` : ''
+    const cx = t.complexity === 'high' ? c.red : t.complexity === 'medium' ? c.yellow : c.green
+    const typeBadge = t.type !== 'execute' ? ` ${c.magenta}[${t.type}]${c.reset}` : ''
+    console.log(`  ${icon.pending} ${c.bold}${id}${c.reset}  ${t.title}  ${cx}[${t.complexity}]${c.reset}${typeBadge}${deps}`)
+  }
+  info(`Session: ${c.bold}${session.id}${c.reset}`)
+  console.log()
+}
 
 program.parse()

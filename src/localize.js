@@ -229,14 +229,51 @@ const REPORT_SCHEMA = {
 // ─── Main export ──────────────────────────────────────────────────────────────
 
 /**
+ * Run the test suite in a repo and return { passed, output }.
+ * Auto-detects pytest vs npm test.
+ */
+export function runTestSuite(repoPath) {
+  const cwd = repoPath
+  const hasPytest = existsSync(`${cwd}/pytest.ini`) ||
+                    existsSync(`${cwd}/setup.cfg`) ||
+                    existsSync(`${cwd}/pyproject.toml`)
+  const cmd = hasPytest
+    ? 'python -m pytest --tb=short -q'
+    : 'npm test'
+  try {
+    const out = execSync(cmd, { cwd, stdio: 'pipe', timeout: 120_000 }).toString()
+    return { passed: true, output: out.slice(0, 3000) }
+  } catch (e) {
+    const out = ((e.stdout?.toString() ?? '') + (e.stderr?.toString() ?? '')).slice(0, 3000)
+    return { passed: false, output: out }
+  }
+}
+
+/**
  * Localize a bug/issue within a repo using an agentic tool-use loop.
  *
- * @param {string}   issueText  - The issue description / bug report
- * @param {string}   repoPath   - Absolute path to the repository on the host
- * @param {function} onChunk    - Called with progress strings (optional)
+ * @param {string}   issueText     - The issue description / bug report
+ * @param {string}   repoPath      - Absolute path to the repository on the host
+ * @param {function} onChunk       - Called with progress strings (optional)
+ * @param {object[]} priorAttempts - Previous failed rounds for reinforcement context
  * @returns {LocalizationReport}
  */
-export async function localizeIssue(issueText, repoPath, onChunk) {
+export async function localizeIssue(issueText, repoPath, onChunk, priorAttempts = []) {
+  // Build prior attempts context block
+  const priorContext = priorAttempts.length === 0 ? '' : `
+## Prior Fix Attempts (all failed — do NOT repeat these approaches)
+${priorAttempts.map((a, i) => `
+### Round ${i + 1} — FAILED
+**Files we thought were relevant:** ${a.localization.relevant_files.map(f => f.path).join(', ')}
+**Fix hypothesis we used:** ${a.localization.fix_hypothesis}
+**What we patched:** ${(a.patchedFiles ?? []).join(', ') || 'unknown'}
+**Test output after fix:**
+\`\`\`
+${a.testOutput?.slice(0, 800) ?? '(no output)'}
+\`\`\`
+**Conclusion:** This localization was wrong or incomplete. Look elsewhere.
+`).join('\n')}`
+
   const prompt = `You are an expert software engineer analyzing a bug report.
 Your job is to localize the issue — find exactly which files, functions, and lines are relevant.
 
@@ -244,13 +281,15 @@ Repository path: ${repoPath}
 
 ## Issue / Bug Report
 ${issueText}
+${priorContext}
 
 ## Instructions
 1. Use get_file_tree to understand the repo structure
-2. Use search_code to find code related to the issue (error messages, function names, keywords)
-3. Use read_file / read_range to read the relevant sections
-4. Use run_tests to see what currently fails (if applicable)
+2. Use run_tests FIRST to see the actual failure output — the traceback gives exact file/line numbers
+3. Use search_code to find code related to the issue (error messages, function names, keywords)
+4. Use read_file / read_range to read the relevant sections
 5. When you have enough information, output a JSON localization report
+${priorAttempts.length > 0 ? '\nIMPORTANT: Previous attempts failed. Look in different files than before. Start from the test traceback, not from the issue description.' : ''}
 
 Be thorough but focused — only include files/functions that are actually relevant to this specific issue.`
 
