@@ -3,6 +3,8 @@
 /**
  * Returns task IDs in topological order (dependencies before dependents).
  * Throws if a circular dependency is detected.
+ * Template tasks (used by for_each/while as specs) are included in the sort
+ * but will be skipped by the runner.
  */
 export function topologicalSort(tasks) {
   const visited = new Set()
@@ -35,27 +37,70 @@ export function topologicalSort(tasks) {
 
 /**
  * Returns IDs of tasks that are pending and have all dependencies completed.
+ * Considers both static (session.dag.order) and dynamic tasks.
  */
 export function getReadyTasks(tasks, order) {
   return order.filter(id => {
     const task = tasks[id]
-    if (task.status !== 'pending') return false
+    if (!task || task.status !== 'pending') return false
     return task.dependencies.every(dep => tasks[dep]?.status === 'completed')
   })
 }
 
 /**
  * Returns IDs of tasks whose status should be 'skipped' because a dependency failed.
+ * barrier tasks use a special rule: only skipped if ALL wait_for tasks failed/skipped.
  */
 export function getBlockedTasks(tasks) {
   return Object.keys(tasks).filter(id => {
     const task = tasks[id]
     if (task.status !== 'pending') return false
+
+    if (task.type === 'barrier') {
+      const waitFor = task.wait_for?.length ? task.wait_for : task.dependencies
+      return waitFor.length > 0 && waitFor.every(dep => {
+        const s = tasks[dep]?.status
+        return s === 'failed' || s === 'skipped'
+      })
+    }
+
     return task.dependencies.some(dep => {
-      const depTask = tasks[dep]
-      return depTask?.status === 'failed' || depTask?.status === 'skipped'
+      const s = tasks[dep]?.status
+      return s === 'failed' || s === 'skipped'
     })
   })
+}
+
+/**
+ * Validate cross-references introduced by control-flow task types.
+ * Called from createSession and insertDynamicTasks.
+ * @param {object} tasks
+ */
+export function validateTaskReferences(tasks) {
+  for (const [id, task] of Object.entries(tasks)) {
+    const type = task.type ?? 'execute'
+
+    if (type === 'branch') {
+      for (const ref of [...(task.on_true ?? []), ...(task.on_false ?? [])]) {
+        if (!tasks[ref]) throw new Error(`branch "${id}": unknown task ref "${ref}"`)
+      }
+    }
+
+    if (type === 'for_each') {
+      if (task.template && !tasks[task.template]) {
+        throw new Error(`for_each "${id}": template task "${task.template}" not found`)
+      }
+      if (task.collect_into && !tasks[task.collect_into]) {
+        throw new Error(`for_each "${id}": collect_into task "${task.collect_into}" not found`)
+      }
+    }
+
+    if (type === 'while') {
+      if (task.body && !tasks[task.body]) {
+        throw new Error(`while "${id}": body template "${task.body}" not found`)
+      }
+    }
+  }
 }
 
 /**

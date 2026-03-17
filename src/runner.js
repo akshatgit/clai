@@ -9,11 +9,33 @@ import { loadSession, saveSession, resetTask } from './state.js'
 import { emit } from './hooks.js'
 import { getReadyTasks, getBlockedTasks, getStats } from './dag.js'
 import { executeTask as _defaultExecutor } from './executor.js'
+import { executeBranch } from './task-types/branch.js'
+import { executeBarrier, BARRIER_PENDING } from './task-types/barrier.js'
+import { executeForEach } from './task-types/for-each.js'
+import { executeWhile } from './task-types/while.js'
+import { executeWait } from './task-types/wait.js'
 
 let _executor = _defaultExecutor
-/** Override the task executor — used by tests to inject mock responses. */
+/** Override the execute-type task executor — used by tests. */
 export function _setExecutor(fn) { _executor = fn }
 export function _resetExecutor() { _executor = _defaultExecutor }
+
+/**
+ * Dispatch to the correct handler based on task.type.
+ * _executor is only used for 'execute' tasks, so test mocks remain scoped.
+ */
+async function dispatchTask(session, task, onChunk) {
+  const type = task.type ?? 'execute'
+  switch (type) {
+    case 'execute':  return _executor(session, task, onChunk)
+    case 'branch':   return executeBranch(session, task, onChunk)
+    case 'for_each': return executeForEach(session, task, onChunk)
+    case 'while':    return executeWhile(session, task, onChunk)
+    case 'barrier':  return executeBarrier(session, task, onChunk)
+    case 'wait':     return executeWait(session, task, onChunk)
+    default: throw new Error(`Unknown task type: "${type}"`)
+  }
+}
 
 /**
  * Run all pending tasks in a session (topological order), or re-run one task.
@@ -107,7 +129,17 @@ export async function runSingleTask(session, taskId, opts = {}) {
   const taskStart = Date.now()
 
   try {
-    const result = await _executor(session, task, onChunk ?? null)
+    const result = await dispatchTask(session, task, onChunk ?? null)
+
+    // Barrier not ready — reset to pending and return silently
+    if (result === BARRIER_PENDING) {
+      session = loadSession(session.id)
+      session.dag.tasks[taskId].status = 'pending'
+      session.dag.tasks[taskId].started_at = null
+      session.dag.tasks[taskId].attempts = Math.max(0, (task.attempts || 1) - 1)
+      saveSession(session)
+      return
+    }
 
     session = loadSession(session.id)
     session.dag.tasks[taskId].status = 'completed'
