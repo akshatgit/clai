@@ -171,3 +171,92 @@ For each task also provide:
 
   return plan.tasks
 }
+
+/**
+ * Plan a focused SWE fix DAG using a localization report.
+ *
+ * Unlike planDAG (which plans from a high-level goal), planSWE receives
+ * the localization report and designs a minimal 3-phase plan:
+ *   1. Apply the fix (targeted edits to the localized files)
+ *   2. while loop: run tests → fix failures (up to max_iterations)
+ *   3. Final validation
+ *
+ * @param {string} issueText         - Original issue description
+ * @param {object} localizationReport - Output from localizeIssue()
+ * @param {string} repoPath           - Absolute path to the repo
+ * @returns {object[]}               - Task array ready for createSession
+ */
+export async function planSWE(issueText, localizationReport, repoPath) {
+  const { summary, relevant_files, relevant_functions, fix_hypothesis, test_files, failing_tests } = localizationReport
+
+  const filesContext = relevant_files.map(f =>
+    `- ${f.path}${f.key_lines?.length ? ` (lines: ${f.key_lines.join(', ')})` : ''}: ${f.reason}`
+  ).join('\n')
+
+  const functionsContext = (relevant_functions ?? []).map(f =>
+    `- ${f.file} → ${f.name}${f.line ? ` (line ${f.line})` : ''}: ${f.relevance}`
+  ).join('\n')
+
+  const testContext = (test_files ?? []).join(', ') || 'unknown'
+  const failingContext = (failing_tests ?? []).join('\n') || 'run the test suite to find out'
+
+  const prompt = `Fix the following issue in the repository at ${repoPath}.
+
+## Issue
+${issueText}
+
+## Localization Report
+**Root cause:** ${summary}
+
+**Fix hypothesis:** ${fix_hypothesis}
+
+**Relevant files:**
+${filesContext}
+
+**Relevant functions:**
+${functionsContext || '(none identified)'}
+
+**Test files:** ${testContext}
+**Currently failing tests:**
+${failingContext}
+
+## Plan requirements
+Design a minimal, surgical fix plan with exactly this structure:
+1. task_1 [execute, complexity: high]: Apply the fix — edit only the localized files. Be surgical.
+2. task_2 [while, max_iterations: 5]: Test-fix loop — run tests, fix failures, repeat until green.
+   - body task (task_fix) [execute]: Read failing test output and patch the code.
+   - condition: "exit: <test command that exits 0 when all tests pass>"
+3. task_3 [execute, complexity: low]: Write a brief summary of what was changed and why.
+
+Set input_paths to the relevant files. Set output_paths to only the files that will be modified.
+Use the correct docker_image for this repo's language (detect from file extensions in the report).`
+
+  const response = await getClient().messages.create({
+    model: 'claude-opus-4-6',
+    max_tokens: 4096,
+    thinking: { type: 'adaptive' },
+    output_config: {
+      format: {
+        type: 'json_schema',
+        schema: PLAN_SCHEMA,
+      },
+    },
+    system: `You are an expert software engineer creating a minimal, surgical fix plan.
+Focus: apply the smallest possible change that fixes the issue. Do not refactor or clean up unrelated code.`,
+    messages: [{ role: 'user', content: prompt }],
+  })
+
+  const text = response.content.find(b => b.type === 'text')?.text
+  if (!text) throw new Error('SWE planner returned no text block')
+
+  const plan = JSON.parse(text)
+
+  const ids = new Set(plan.tasks.map(t => t.id))
+  for (const task of plan.tasks) {
+    for (const dep of task.dependencies ?? []) {
+      if (!ids.has(dep)) throw new Error(`Task "${task.id}" has unknown dependency "${dep}"`)
+    }
+  }
+
+  return plan.tasks
+}
