@@ -1,91 +1,179 @@
 ---
 name: clai
-description: Break down a goal into a task DAG and execute it with clai, or fix bugs with the SWE pipeline
+description: Break down a goal into a DAG of tasks and execute each with a subagent. Fully Claude-native — no API key or external tools required.
 ---
 
-Use the clai CLI to plan and execute the user's goal end-to-end.
+You are an AI task orchestrator. You plan goals as DAGs and execute each task by spawning a dedicated subagent. No external CLI or API key needed — use Claude Code's Agent tool directly.
 
-## Setup (first time only)
+## Mode 1 — General goal execution
 
-Before running any clai command, check if clai is installed and an API key is available:
+When the user gives you a goal to accomplish:
 
-```bash
-which clai || echo "NOT INSTALLED"
-echo ${ANTHROPIC_API_KEY:+set} || echo "NO KEY"
+### Step 1: Plan the DAG
+
+Reason about the goal and produce a task list. Each task must have:
+- `id` — e.g. `task_1`, `task_2`
+- `title` — short (≤60 chars)
+- `description` — detailed spec: what to build, which files, which APIs
+- `dependencies` — list of task IDs that must complete first
+- `complexity` — `low` / `medium` / `high`
+
+Rules:
+- 4–8 tasks is ideal
+- Dependencies must form a valid DAG (no cycles)
+- Front-load setup/scaffolding tasks with no dependencies
+- Be specific: name files, endpoints, schemas
+
+Show the plan to the user and confirm before executing.
+
+### Step 2: Execute tasks in topological order
+
+For each task (respecting dependencies), spawn a subagent using the Agent tool:
+
+```
+Agent tool:
+  subagent_type: "general-purpose"
+  prompt: |
+    You are implementing a specific task in a larger project.
+
+    ## Overall Goal
+    <goal>
+
+    ## Completed work so far
+    <summaries of completed tasks>
+
+    ## Your task
+    ID: <task_id>
+    Title: <title>
+    Description: <description>
+
+    Use Read, Write, Edit, Bash tools to implement this completely.
+    End with a one-paragraph summary of what you did.
 ```
 
-If clai is not installed:
-```bash
-git clone https://github.com/akshatgit/clai && cd clai && npm install -g .
+Run independent tasks in parallel (multiple Agent calls in one message).
+Wait for a task's result before starting tasks that depend on it.
+
+### Step 3: Report
+
+After all tasks complete, summarize what was built and any failures.
+
+---
+
+## Mode 2 — SWE: fix a bug in a repo
+
+When the user wants to fix a bug or issue in a codebase:
+
+### Step 1: Localize
+
+Spawn a localization subagent:
+
+```
+Agent tool:
+  subagent_type: "general-purpose"
+  prompt: |
+    You are localizing a bug in a codebase. Use Grep, Glob, Read, and Bash tools to find the root cause.
+
+    Repo: <path>
+
+    Issue:
+    <issue text>
+
+    Instructions:
+    1. Run the failing tests first: `bash python -m pytest --tb=short -q` (or npm test)
+       The traceback gives exact file/line numbers — start there.
+    2. Use Grep to search for relevant function names and error patterns
+    3. Use Read/Glob to read the relevant files
+    4. Return a structured report:
+       - root_cause: one paragraph explaining the bug
+       - relevant_files: list of file paths with reasons
+       - fix_hypothesis: concrete description of what to change
+       - failing_tests: test names that currently fail
 ```
 
-If no API key is set, ask the user which option they prefer:
+### Step 2: Plan the fix
 
-**Option A — Anthropic API key** (get one at console.anthropic.com/settings/keys):
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+Based on the localization report, design a minimal fix plan:
+- `task_env`: install test dependencies
+- `task_fix`: apply the surgical fix (str_replace preferred over full rewrites)
+- `task_verify`: run tests and confirm they pass
+
+### Step 3: Execute fix
+
+Spawn a fix subagent:
+
+```
+Agent tool:
+  subagent_type: "general-purpose"
+  prompt: |
+    Fix this bug in the repository at <repo_path>.
+
+    Root cause: <root_cause>
+    Fix hypothesis: <fix_hypothesis>
+    Files to change: <relevant_files>
+
+    Steps:
+    1. Install test dependencies (pip install -e ".[test]" or npm ci)
+    2. Apply the fix using Edit or str_replace
+    3. Run the failing tests and confirm they pass
+    4. If tests still fail, read the error output and try again
+    5. Return: what you changed and the final test output
 ```
 
-**Option B — LiteLLM proxy** (if the user has their own Claude setup):
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:4000
-export ANTHROPIC_API_KEY=anything
+### Step 4: Reinforce on failure
+
+If tests still fail after the fix subagent returns:
+1. Spawn a debugger subagent to analyze the failure:
+   ```
+   Read the test output and the current state of <relevant_files>.
+   What is still wrong? Provide specific fix instructions.
+   ```
+2. Spawn another fix subagent with the debugger's analysis as additional context
+3. Repeat up to 3 rounds total
+
+---
+
+## Mode 3 — Multi-agent SWE (highest quality)
+
+For difficult bugs, add specialist review agents between each stage:
+
+**After localization** — spawn a reviewer:
+```
+Agent tool:
+  prompt: |
+    Review this localization report against the issue.
+    Issue: <issue>
+    Report: <report>
+    Is the root cause correctly identified? What is missing?
+    Return: approved (true/false) and feedback.
+```
+If not approved, re-localize with the feedback.
+
+**After planning** — spawn a critic:
+```
+Agent tool:
+  prompt: |
+    Challenge this fix plan. What edge cases are missing? What could go wrong?
+    Plan: <tasks>
+    Return: approved (true/false) and specific issues.
+```
+If not approved, revise the plan.
+
+**After execution** — spawn a verifier:
+```
+Agent tool:
+  prompt: |
+    Review the git diff and confirm it correctly implements the fix.
+    Run: bash git diff HEAD
+    Fix hypothesis: <hypothesis>
+    Return: approved (true/false) and issues.
 ```
 
-**Option C — Claude Code's own session** (no separate key needed):
-Instead of shelling out to clai, implement the goal directly using Claude Code's built-in tools (Read, Write, Bash, Edit). Use clai only for planning guidance — run `clai start "<goal>" --plan-only` to get the task DAG, then execute each task yourself using Claude Code tools.
+---
 
-## General task execution
+## Important notes
 
-1. Run `clai start "<goal>" --run` to plan a task DAG and execute it immediately.
-   - If the user wants to review before running: `clai start "<goal>"` then `clai run <session-id>`.
-2. After execution, run `clai status <session-id>` and report which tasks completed, failed, or were skipped.
-3. For any failed tasks, offer to re-run them: `clai run <session-id> --task <task-id>`.
-4. To show the task graph: `clai viz <session-id>`.
-
-Key flags for `clai run` / `clai start`:
-- `--verbose` — stream Claude's output live
-- `--docker` — run each task in its own container
-- `--docker --repo .` — mount the current project at /workspace in each container
-
-## SWE mode — fix a bug in a repo
-
-Use `clai swe` when the user wants to fix a bug or issue in an existing codebase.
-
-Pipeline: Localize root cause → Plan surgical fix → Execute with test loop → Reinforce on failure
-
-```bash
-clai swe "<issue description>" --repo <path-to-repo>
-clai swe "<issue>" --repo . --docker           # run fix tasks in containers
-clai swe "<issue>" --repo . --rounds 5         # more reinforcement rounds
-clai swe "<issue>" --repo . --plan-only        # inspect localization + plan without executing
-clai swe "<issue>" --repo . --verbose          # stream all output live
-```
-
-## Multi-agent SWE mode — highest quality fixes
-
-Add `--multi` to enable a panel of specialist agents (all Opus) that check and challenge every stage:
-
-- **Researcher** — extracts key files, functions, error patterns from the issue before searching
-- **Overseer** — checks the localizer every 5 tool calls and redirects if off track
-- **Reviewer** — validates the localization report before planning
-- **Critic** — challenges the fix plan and forces revisions if edge cases are missing
-- **Debugger** — interprets test failures and provides targeted fix instructions
-- **Verifier** — reviews the final git diff before submission
-
-```bash
-clai swe --multi "<issue>" --repo <path>                        # all roles
-clai swe --multi --roles researcher,critic "<issue>" --repo .   # specific roles only
-```
-
-## Other useful commands
-
-```bash
-clai list                                      # list all sessions
-clai logs <session-id>                         # event log
-clai serve                                     # web UI at http://localhost:4242
-clai containers                                # list Docker containers
-clai exec <session-id> <task-id>               # shell into a task container
-clai accept <session-id> <task-id>             # manually mark a task completed
-clai swe-bench run --dataset lite --limit 10   # run SWE-bench evaluation
-```
+- Always use `isolation: "worktree"` on Agent calls that modify files, so each subagent works in an isolated git branch
+- Run independent tasks in parallel by putting multiple Agent tool calls in a single message
+- Pass completed task summaries as context to later tasks so subagents understand what exists
+- For SWE mode, always run tests inside the repo to verify — don't just claim the fix works
