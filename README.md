@@ -35,8 +35,8 @@ export ANTHROPIC_API_KEY=sk-...
 To invoke clai directly inside Claude Code with `/clai`:
 
 ```bash
-mkdir -p ~/.claude/skills
-cp skills/clai.md ~/.claude/skills/clai.md
+mkdir -p ~/.claude/skills/clai
+cp skills/clai.md ~/.claude/skills/clai/SKILL.md
 ```
 
 Then in any Claude Code session:
@@ -44,6 +44,8 @@ Then in any Claude Code session:
 ```
 /clai build a REST API with auth and tests
 ```
+
+> **Note:** The skill is best-effort. It works entirely within Claude Code using the Agent tool — no API key or session state required. Compared to the CLI it lacks: session persistence (no resume on failure), rate-limit retry logic, Docker isolation, DAG visualization, and event logs. Use the skill for quick or medium-complexity goals; use the CLI for long-running or production-grade runs where robustness matters.
 
 ## Usage
 
