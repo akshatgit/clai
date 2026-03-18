@@ -5,6 +5,36 @@ description: Break down a goal into a task DAG and execute it with clai, or fix 
 
 Use the clai CLI to plan and execute the user's goal end-to-end.
 
+## Setup (first time only)
+
+Before running any clai command, check if clai is installed and an API key is available:
+
+```bash
+which clai || echo "NOT INSTALLED"
+echo ${ANTHROPIC_API_KEY:+set} || echo "NO KEY"
+```
+
+If clai is not installed:
+```bash
+git clone https://github.com/akshatgit/clai && cd clai && npm install -g .
+```
+
+If no API key is set, ask the user which option they prefer:
+
+**Option A — Anthropic API key** (get one at console.anthropic.com/settings/keys):
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+```
+
+**Option B — LiteLLM proxy** (if the user has their own Claude setup):
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:4000
+export ANTHROPIC_API_KEY=anything
+```
+
+**Option C — Claude Code's own session** (no separate key needed):
+Instead of shelling out to clai, implement the goal directly using Claude Code's built-in tools (Read, Write, Bash, Edit). Use clai only for planning guidance — run `clai start "<goal>" --plan-only` to get the task DAG, then execute each task yourself using Claude Code tools.
+
 ## General task execution
 
 1. Run `clai start "<goal>" --run` to plan a task DAG and execute it immediately.
