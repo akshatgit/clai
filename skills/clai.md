@@ -135,9 +135,37 @@ If tests still fail after the fix subagent returns:
 
 ## Mode 3 — Multi-agent SWE (highest quality)
 
-For difficult bugs, add specialist review agents between each stage:
+For difficult bugs, add specialist review agents between each stage. All 6 roles:
 
-**After localization** — spawn a reviewer:
+**1. Researcher** — spawn BEFORE localization:
+```
+Agent tool:
+  prompt: |
+    Analyze this bug report and extract actionable search signals.
+    Issue: <issue>
+    Return:
+    - key_functions: function/method names mentioned or implied
+    - key_files: file paths or modules mentioned
+    - error_patterns: exact error messages or exception types
+    - test_names: test function names if mentioned
+    - search_queries: 3-5 ripgrep strings to find the relevant code
+    - hypothesis: one precise sentence about where the bug is and why
+```
+Inject the researcher's output into the localizer's prompt as a "Research Context" block.
+
+**2. Overseer** — spawn every 5 tool calls DURING localization:
+```
+Agent tool:
+  prompt: |
+    A localization agent is searching for a bug. Review its recent actions.
+    Issue: <issue>
+    Recent tool calls: <last 5 tool calls the localizer made>
+    Is it investigating the right area? If not, give a one-sentence redirect.
+    Return: on_track (true/false) and guidance.
+```
+If not on_track, inject the guidance as a message back to the localizer.
+
+**3. Reviewer** — spawn AFTER localization:
 ```
 Agent tool:
   prompt: |
@@ -147,27 +175,40 @@ Agent tool:
     Is the root cause correctly identified? What is missing?
     Return: approved (true/false) and feedback.
 ```
-If not approved, re-localize with the feedback.
+If not approved, re-localize with the feedback (max 2 rejections).
 
-**After planning** — spawn a critic:
+**4. Critic** — spawn AFTER planning:
 ```
 Agent tool:
   prompt: |
     Challenge this fix plan. What edge cases are missing? What could go wrong?
-    Plan: <tasks>
-    Return: approved (true/false) and specific issues.
+    Issue: <issue>  Fix hypothesis: <hypothesis>  Plan: <tasks>
+    Return: approved (true/false), issues list, and suggestion for revision.
 ```
-If not approved, revise the plan.
+If not approved, revise the plan with the critic's suggestion (max 1 revision).
 
-**After execution** — spawn a verifier:
+**5. Debugger** — spawn AFTER test failure:
 ```
 Agent tool:
   prompt: |
-    Review the git diff and confirm it correctly implements the fix.
-    Run: bash git diff HEAD
-    Fix hypothesis: <hypothesis>
-    Return: approved (true/false) and issues.
+    An automated fix was applied but tests still fail. Diagnose the remaining problem.
+    Localization: <report>  Patched files: <files>
+    Test output:
+    <test output>
+    Return: root_cause, fix_instructions (specific and actionable), affected_files.
 ```
+Inject the debugger's analysis as context for the next fix round.
+
+**6. Verifier** — spawn AFTER execution:
+```
+Agent tool:
+  prompt: |
+    Review the patch and confirm it correctly fixes the issue.
+    Run: bash git diff HEAD  (in <repo_path>)
+    Fix hypothesis: <hypothesis>
+    Return: approved (true/false), issues, summary.
+```
+If not approved, trigger another fix round with the verifier's issues as context.
 
 ---
 
