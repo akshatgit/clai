@@ -116,6 +116,40 @@ clai swe "null pointer in user service" --repo ./app --plan-only
 clai swe "broken CSV export" --repo ./app --verbose
 ```
 
+### Multi-agent mode
+
+Add `--multi` to enable a full panel of specialist agents — all running Opus — that check and challenge each stage of the pipeline:
+
+| Role | When | Does |
+|---|---|---|
+| **Researcher** | Before localization | Extracts key functions, files, error patterns, and a search hypothesis from the issue |
+| **Overseer** | Every 5 tool calls during localization | Checks if the localizer is on the right track; injects a redirect if not |
+| **Reviewer** | After localization | Validates the localization report before planning; rejects and re-localizes if incomplete |
+| **Critic** | After planning | Challenges the fix plan; forces a revision if edge cases are missing |
+| **Debugger** | After test failure | Reads the traceback, identifies root cause, provides targeted fix instructions for the next round |
+| **Verifier** | After execution | Reviews the `git diff` patch before final submission |
+
+```bash
+# All roles enabled (Researcher → Overseer → Reviewer → Critic → Debugger → Verifier)
+clai swe --multi "separability_matrix returns wrong result for nested CompoundModels" --repo ./astropy
+
+# Enable specific roles only
+clai swe --multi --roles researcher,critic,debugger_ "bug description" --repo ./my-repo
+
+# Combine with other flags
+clai swe --multi --docker --rounds 5 --verbose "issue text" --repo ./app
+```
+
+#### Custom model backend (LiteLLM / proxy)
+
+Point clai at any OpenAI-compatible proxy:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:4000   # LiteLLM or other proxy
+export ANTHROPIC_API_KEY=anything                 # required by SDK, value ignored by proxy
+clai swe --multi "bug description" --repo ./app
+```
+
 ## Turing-complete task types
 
 In addition to plain tasks, the planner can emit control-flow task types that make DAGs Turing-complete at runtime:
@@ -189,28 +223,29 @@ ssh -L 4242:localhost:4242 user@server
 
 ```
 src/
-  index.js        CLI (commander) — start, run, status, list, logs, viz, serve, containers, exec, accept, swe
-  planner.js      Claude Opus plans the task DAG (structured JSON output)
-  executor.js     Claude executes tasks via tool use (write_file, run_command, read_file)
-  localize.js     Agentic repo navigator — pinpoints root-cause files/functions
-  reinforce.js    Outer reinforcement loop — re-localizes on failure with prior context
-  runner.js       Dispatches tasks by type (plain, branch, for_each, while, barrier, wait)
-  client.js       Anthropic SDK wrapper with rate-limit retry and debug logging
-  docker.js       Docker container runner — RO base mount + RW overlays per output path
-  worker.js       In-container task executor (called via docker exec)
-  condition.js    Evaluates shell / JS expression / natural language conditions
-  template.js     cloneTask with {{variable}} substitution, resolveItems
-  state.js        Session persistence (sessions/*.json)
-  dag.js          Topological sort, ready-task selection, cycle detection, barrier-awareness
-  hooks.js        Event emission to JSONL logs
-  viz.js          Terminal + HTML DAG visualizer
+  index.js          CLI (commander) — start, run, status, list, logs, viz, serve, swe, swe-bench
+  planner.js        Claude Opus plans the task DAG (structured JSON output)
+  executor.js       Claude executes tasks via tool use (write_file, run_command, read_file, str_replace)
+  localize.js       Agentic repo navigator — pinpoints root-cause files/functions
+  reinforce.js      Outer reinforcement loop — re-localizes on failure with prior context
+  reinforce-multi.js  Multi-agent reinforcement loop — adds role hooks at every pipeline stage
+  roles.js          All six specialist roles (Researcher, Overseer, Reviewer, Critic, Debugger, Verifier)
+  runner.js         Dispatches tasks by type (plain, branch, for_each, while, barrier, wait)
+  client.js         Anthropic SDK wrapper with retry-after-aware rate limit handling
+  docker.js         Docker container runner — host-side executor with docker exec proxy
+  condition.js      Evaluates shell / JS expression / natural language conditions
+  template.js       cloneTask with {{variable}} substitution, resolveItems
+  state.js          Session persistence (sessions/*.json)
+  dag.js            Topological sort, ready-task selection, cycle detection, barrier-awareness
+  hooks.js          Event emission to JSONL logs
+  viz.js            Terminal + HTML DAG visualizer
   task-types/
-    branch.js     branch task handler
-    for-each.js   for_each task handler
-    while.js      while task handler
-    barrier.js    barrier task handler
-    wait.js       wait task handler
+    branch.js       branch task handler
+    for-each.js     for_each task handler
+    while.js        while task handler
+    barrier.js      barrier task handler
+    wait.js         wait task handler
   commands/
-    exec.js       Handler for clai exec
-    accept.js     Handler for clai accept
+    exec.js         Handler for clai exec
+    accept.js       Handler for clai accept
 ```

@@ -268,21 +268,48 @@ export function runTestSuite(repoPath) {
  * @param {object[]} priorAttempts - Previous failed rounds for reinforcement context
  * @returns {LocalizationReport}
  */
-export async function localizeIssue(issueText, repoPath, onChunk, priorAttempts = []) {
+/**
+ * @param {string}   issueText
+ * @param {string}   repoPath
+ * @param {function} onChunk
+ * @param {object[]} priorAttempts
+ * @param {object}   opts
+ * @param {object}   [opts.researcherContext]  - Output from researcher role; injected into prompt
+ * @param {function} [opts.overseer]           - Called every 5 tool calls: (issueText, recentCalls) => { on_track, guidance }
+ */
+export async function localizeIssue(issueText, repoPath, onChunk, priorAttempts = [], opts = {}) {
+  const { researcherContext = null, overseer = null } = opts
+
   // Build prior attempts context block
   const priorContext = priorAttempts.length === 0 ? '' : `
 ## Prior Fix Attempts (all failed — do NOT repeat these approaches)
 ${priorAttempts.map((a, i) => `
 ### Round ${i + 1} — FAILED
-**Files we thought were relevant:** ${a.localization.relevant_files.map(f => f.path).join(', ')}
-**Fix hypothesis we used:** ${a.localization.fix_hypothesis}
+**Files we thought were relevant:** ${a.localization?.relevant_files?.map(f => f.path).join(', ') ?? 'unknown'}
+**Fix hypothesis we used:** ${a.localization?.fix_hypothesis ?? 'unknown'}
 **What we patched:** ${(a.patchedFiles ?? []).join(', ') || 'unknown'}
 **Test output after fix:**
 \`\`\`
 ${a.testOutput?.slice(0, 800) ?? '(no output)'}
 \`\`\`
+${a.debuggerAnalysis ? `**Debugger analysis:** ${a.debuggerAnalysis.root_cause}
+**Fix instructions from debugger:** ${a.debuggerAnalysis.fix_instructions}
+**Debugger identified files:** ${a.debuggerAnalysis.affected_files?.join(', ') ?? 'unknown'}` : ''}
+${a.reviewerFeedback ? `**Reviewer feedback:** ${a.reviewerFeedback}` : ''}
 **Conclusion:** This localization was wrong or incomplete. Look elsewhere.
 `).join('\n')}`
+
+  // Researcher context block (injected when multi-agent mode is on)
+  const researchContext = researcherContext ? `
+## Research Context (pre-analyzed — start here)
+**Key functions:** ${researcherContext.key_functions?.join(', ') ?? 'none'}
+**Key files:** ${researcherContext.key_files?.join(', ') ?? 'none'}
+**Error patterns:** ${researcherContext.error_patterns?.join(', ') ?? 'none'}
+**Test names:** ${researcherContext.test_names?.join(', ') ?? 'none'}
+**Suggested searches:** ${researcherContext.search_queries?.join('; ') ?? 'none'}
+**Hypothesis:** ${researcherContext.hypothesis}
+
+Start your investigation with these leads before exploring elsewhere.` : ''
 
   const prompt = `You are an expert software engineer analyzing a bug report.
 Your job is to localize the issue — find exactly which files, functions, and lines are relevant.
@@ -291,6 +318,7 @@ Repository path: ${repoPath}
 
 ## Issue / Bug Report
 ${issueText}
+${researchContext}
 ${priorContext}
 
 ## Instructions
@@ -305,11 +333,13 @@ ${priorAttempts.length > 0 ? '\nIMPORTANT: Previous attempts failed. Look in dif
 Be thorough but focused — only include files/functions that are actually relevant to this specific issue.`
 
   const messages = [{ role: 'user', content: prompt }]
+  let toolCallCount = 0
+  const recentToolCalls = []  // rolling window for overseer
 
   // Agentic loop — runs until Claude calls submit_report
   while (true) {
     const response = await client.messages.create({
-      model: MODELS.medium,
+      model: MODELS.low,
       max_tokens: 16000,
       system: 'You are an expert software engineer. Localize bugs precisely using the provided tools. When done, call submit_report.',
       tools: LOCALIZE_TOOLS,
@@ -337,6 +367,26 @@ Be thorough but focused — only include files/functions that are actually relev
       const output = executeLocalizeTool(block.name, block.input, repoPath)
       if (onChunk) onChunk(`→ ${output.slice(0, 200)}\n`)
       toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: output })
+
+      // Track tool calls for overseer
+      toolCallCount++
+      recentToolCalls.push({ name: block.name, input: block.input })
+      if (recentToolCalls.length > 10) recentToolCalls.shift()
+    }
+
+    // Overseer checkpoint every 5 tool calls
+    if (overseer && toolCallCount > 0 && toolCallCount % 5 === 0) {
+      try {
+        const check = await overseer(issueText, recentToolCalls.slice(-5))
+        if (!check.on_track && check.guidance) {
+          if (onChunk) onChunk(`\n[overseer: redirecting — ${check.guidance}]\n`)
+          toolResults.push({ type: 'text', text: `[OVERSEER]: ${check.guidance}` })
+        } else if (onChunk) {
+          onChunk(`\n[overseer: on track ✓]\n`)
+        }
+      } catch (err) {
+        if (onChunk) onChunk(`\n[overseer: error — ${err.message}]\n`)
+      }
     }
 
     // If stop_reason is end_turn with no submit_report, something went wrong

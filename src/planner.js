@@ -221,7 +221,7 @@ function detectPythonImage(repoPath) {
  * @param {string} repoPath           - Absolute path to the repo
  * @returns {object[]}               - Task array ready for createSession
  */
-export async function planSWE(issueText, localizationReport, repoPath) {
+export async function planSWE(issueText, localizationReport, repoPath, criticFeedback = null) {
   const { summary, relevant_files, relevant_functions, fix_hypothesis, test_files, failing_tests } = localizationReport
 
   const filesContext = relevant_files.map(f =>
@@ -278,7 +278,8 @@ Design a minimal, surgical fix plan with exactly this structure:
 4. task_summary [execute, complexity: low, depends on task_loop]: Write a brief summary of what was changed and why.
 
 Set input_paths to the relevant files. Set output_paths to only the files that will be modified.
-Use the correct docker_image for this repo's language (detect from file extensions in the report).`
+Use the correct docker_image for this repo's language (detect from file extensions in the report).
+${criticFeedback ? `\n## Critic Feedback (MUST address in this plan)\n${criticFeedback}` : ''}`
 
   const response = await client.messages.create({
     model: MODELS.high,

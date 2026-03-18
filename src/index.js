@@ -1245,6 +1245,8 @@ program
   .option('--rounds <n>',     'Max outer reinforcement rounds (default 3)', '3')
   .option('--plan-only',      'Stop after first localize+plan (do not execute)')
   .option('--verbose',        'Stream Claude output live')
+  .option('--multi',          'Enable multi-agent mode (Researcher, Overseer, Reviewer, Critic, Debugger, Verifier — all Opus)')
+  .option('--roles <list>',   'Comma-separated roles to enable in multi mode (default: all). E.g. researcher,critic,debugger_')
   .action(async (issue, opts) => {
     setupLoggingHooks()
     const repoPath = opts.repo ?? process.cwd()
@@ -1283,33 +1285,44 @@ program
     }
 
     // Full reinforced run
-    header('SWE — Reinforced Fix')
+    header(`SWE — ${opts.multi ? 'Multi-Agent' : 'Reinforced'} Fix`)
     info(`Issue: ${issue.slice(0, 100)}`)
     info(`Repo:  ${repoPath}`)
     info(`Rounds: up to ${maxRounds}`)
+    if (opts.multi) info(`Roles: ${opts.roles ?? 'all'} (Opus)`)
     console.log()
+
+    const sharedOpts = {
+      maxRounds,
+      verbose: opts.verbose,
+      useDocker: opts.docker,
+      onChunk: chunk => {
+        if (opts.verbose) process.stdout.write(chunk)
+        else process.stdout.write('.')
+      },
+      onRound: (round, total) => {
+        if (!opts.verbose) console.log()
+        header(`Round ${round} / ${total}`)
+      },
+      onLocalized: (round, report) => { printLocalizationReport(report) },
+      onPlanned:   (round, session) => { printPlan(session) },
+    }
 
     let result
     try {
-      result = await reinforcedSWE(issue, repoPath, {
-        maxRounds,
-        verbose: opts.verbose,
-        useDocker: opts.docker,
-        onChunk: chunk => {
-          if (opts.verbose) process.stdout.write(chunk)
-          else process.stdout.write('.')
-        },
-        onRound: (round, total) => {
-          if (!opts.verbose) console.log()
-          header(`Round ${round} / ${total}`)
-        },
-        onLocalized: (round, report) => {
-          printLocalizationReport(report)
-        },
-        onPlanned: (round, session) => {
-          printPlan(session)
-        },
-      })
+      if (opts.multi) {
+        const { reinforcedSWEMulti } = await import('./reinforce-multi.js')
+        const allRoles = await import('./roles.js')
+        const enabledNames = opts.roles ? opts.roles.split(',').map(s => s.trim()) : null
+        const roles = {}
+        for (const [name, fn] of Object.entries(allRoles)) {
+          if (typeof fn !== 'function') continue
+          if (!enabledNames || enabledNames.includes(name)) roles[name] = fn
+        }
+        result = await reinforcedSWEMulti(issue, repoPath, { ...sharedOpts, roles })
+      } else {
+        result = await reinforcedSWE(issue, repoPath, sharedOpts)
+      }
     } catch (err) {
       fail(`SWE failed: ${err.message}`)
       process.exit(1)
